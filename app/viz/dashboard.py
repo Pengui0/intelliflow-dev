@@ -3280,10 +3280,20 @@ window.addEventListener("load", async () => {
 
     if (data.found) {
       console.log("Loaded pretrained weights");
+      
+      setTimeout(() => {
+        if (data.found && DQN) {
+          DQN.online = data.data.online;
+          DQN.target = data.data.target;
+          DQN.EPSILON = data.data.epsilon;
+          DQN.trainSteps = data.data.trainSteps || 0;
 
-      if (window.dqnAgent) {
-        window.dqnAgent.load(data.data);
-      }
+          console.log("✅ Weights applied to DQN");
+        } else {
+          console.log("⚠️ No weights or DQN missing");
+        }
+      }, 500);
+
 
       // update UI directly
       document.getElementById("rl-episodes").textContent = data.data.episodes || 60;
