@@ -959,17 +959,16 @@ var DQN = {
 
   loadModel: async function() {
     try {
-      var resp = await fetch('https://raw.githubusercontent.com/Pengui0/IntelliFlow-openenv/main/dqn_weights.json');
+      var resp = await fetch('/load_weights');
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       var json = await resp.json();
+      if (!json.found || !json.data) return false;
       var d = json.data;
       this.online        = QNetwork.fromJSON(d.online);
       this.target        = QNetwork.fromJSON(d.target);
       this.EPSILON       = typeof d.epsilon      === 'number' ? d.epsilon      : 1.0;
-      this.trainSteps = d.trainSteps ?? 10000;
-      this.totalSteps = d.totalSteps ?? 10000;
-      this.loadedFromWeights = true;
-      this.trainingEnabled = false;
+      this.trainSteps    = d.trainSteps    || 0;
+      this.totalSteps    = d.totalSteps    || 0;
       this.episodes      = d.episodes      || 0;
       this.lossHist      = d.lossHist      || [];
       this.rollingReward = d.rollingReward || 0;
@@ -1076,7 +1075,7 @@ var DQN = {
     if(this.trainSteps > 5000) this.LR = 0.0001;
     if(this.trainSteps > 8000) this.LR = 0.00005;
 
-    if (this.trainingEnabled && this.replay.length >= this.BATCH_SIZE) {
+    if (this.replay.length >= this.BATCH_SIZE) {
       this.trainBatch();
     }
 
@@ -3273,49 +3272,6 @@ document.addEventListener('fullscreenchange', function() {
     b.style.color = 'var(--text-dim)';
   }
 });
-
-window.addEventListener("load", async () => {
-  try {
-    const res = await fetch(window.location.origin + "/load_weights");
-    const data = await res.json();
-
-    if (data.found) {
-      console.log("Loaded pretrained weights");
-
-      setTimeout(() => {
-        if (data.found && DQN) {
-          if (DQN.online && data.data.online) {
-            DQN.online.weights = data.data.online.weights;
-            DQN.online.weights = data.data.online.weights;
-          }
-
-          if (DQN.target && data.data.target) {
-            DQN.target.weights = data.data.target.weights;
-            DQN.target.biases = data.data.target.biases;
-          }
-
-          DQN.EPSILON = data.data.epsilon;
-          DQN.trainSteps = data.data.trainSteps || 0;
-
-          console.log("✅ Weights applied to DQN");
-        } else {
-          console.log("⚠️ No weights or DQN missing");
-        }
-      }, 500);
-
-
-      // update UI directly
-      document.getElementById("rl-episodes").textContent = data.data.episodes || 60;
-      document.getElementById("rl-epsilon").textContent = data.data.epsilon?.toFixed(3) || "0.050";
-
-    } else {
-      console.log("No weights found");
-    }
-  } catch (e) {
-    console.error("Load weights error:", e);
-  }
-});
-
 </script>
 </body>
 </html>"""
