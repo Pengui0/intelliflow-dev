@@ -1,0 +1,291 @@
+# openenv.yaml
+# IntelliFlow Urban Traffic Control Environment
+# OpenEnv Specification Metadata v1.0
+# ─────────────────────────────────────────────
+
+name: IntelliFlow Urban Traffic Control
+version: "1.0.0"
+description: >
+  A production-grade reinforcement learning simulation environment modelling
+  a realistic urban intersection as a controllable episodic decision system.
+  An intelligent agent dynamically optimises traffic signal phases to minimise
+  congestion, waiting time, lane starvation, and emission proxies while
+  maximising vehicle throughput and systemic efficiency.
+
+authors:
+  - IntelliFlow Research Team
+
+real_world_domain: Urban Transportation / Smart City Infrastructure
+tags:
+  - traffic-control
+  - reinforcement-learning
+  - urban-simulation
+  - multi-objective
+  - openenv
+
+# ─────────────────────────────────────────────
+# Observation Space
+# ─────────────────────────────────────────────
+observation_space:
+  type: Box
+  dtype: float32
+  shape: [57]
+  bounds:
+    low: -1.0   # pressure_differential can be negative
+    high: 1.0
+  description: >
+    57-dimensional continuous observation vector encoding the full intersection
+    state at each simulation step.
+  components:
+    - name: queue_lengths
+      indices: [0, 11]      # inclusive range
+      dim: 12
+      description: >
+        Normalised queue length per lane [0,1].
+        0 = empty, 1 = at capacity.
+        Lane order: N_through, N_right, S_through, S_right,
+                    E_through, E_right, W_through, W_right,
+                    N_left, S_left, E_left, W_left.
+
+    - name: throughput_recent
+      indices: [12, 23]
+      dim: 12
+      description: >
+        Recent 10-step normalised throughput per lane.
+        Computed as vehicles_cleared / capacity.
+
+    - name: arrival_intensity
+      indices: [24, 35]
+      dim: 12
+      description: >
+        Estimated Poisson arrival intensity per lane, normalised
+        by saturation flow rate. Derived from 10-step sliding window.
+
+    - name: phase_onehot
+      indices: [36, 39]
+      dim: 4
+      description: >
+        One-hot encoding of current signal phase.
+        [NS_GREEN, EW_GREEN, ALL_RED, NS_MINOR]
+
+    - name: phase_elapsed_norm
+      indices: [40]
+      dim: 1
+      description: >
+        Elapsed time in current phase normalised by max_phase_duration.
+
+    - name: fairness_score
+      indices: [41]
+      dim: 1
+      description: >
+        Normalised variance of per-lane accumulated wait times.
+        0 = perfectly fair, 1 = maximally unfair.
+
+    - name: pressure_differential
+      indices: [42]
+      dim: 1
+      description: >
+        (NS_pressure - EW_pressure) / total_pressure.
+        In [-1, 1]. Positive = NS approach has more queue pressure.
+
+    - name: avg_delay_norm
+      indices: [43]
+      dim: 1
+      description: >
+        Rolling average vehicle delay (s) normalised by 120s.
+        Clamped to [0, 1].
+
+    - name: step_norm
+      indices: [44]
+      dim: 1
+      description: Episode progress in [0, 1].
+
+    - name: spillback_flags
+      indices: [45, 56]
+      dim: 12
+      description: >
+        Binary spillback risk indicator per lane.
+        1 = queue ≥ 85% of capacity (spillback imminent).
+
+# ─────────────────────────────────────────────
+# Action Space
+# ─────────────────────────────────────────────
+action_space:
+  type: Discrete
+  n: 5
+  actions:
+    0:
+      name: MAINTAIN
+      description: Keep current signal phase unchanged
+    1:
+      name: SWITCH_PHASE
+      description: Toggle to orthogonal phase (N-S ↔ E-W green)
+      constraint: Only effective if phase_elapsed >= min_phase_duration (5 steps)
+    2:
+      name: EXTEND_GREEN
+      description: >
+        Implicitly extend current green phase. The agent signals intent
+        to hold the current phase; the phase auto-switches at max_phase_duration.
+    3:
+      name: FORCE_ALL_RED
+      description: Immediately enter all-red safety interval (3 steps)
+    4:
+      name: YIELD_MINOR
+      description: >
+        Enter NS_MINOR phase to give brief green to minor side-road
+        right-turn approaches.
+
+# ─────────────────────────────────────────────
+# Reward Function
+# ─────────────────────────────────────────────
+reward:
+  type: dense
+  frequency: every_step
+  range: "approximately [-1.5, +1.5] per step under normal conditions"
+  design_principles:
+    - "Positive baseline: near zero on neutral steps, clearly positive when doing well"
+    - "Delta-based queue signal: rewards queue REDUCTION, not just penalising absolute size"
+    - "Context-aware switch penalty: oscillation penalised; pressure-justified switches are not"
+    - "Max-deviation fairness: detects single starved lane; variance averages it away"
+    - "Escalating spillback: quadratic severity above 85% capacity"
+    - "Proactive bonus: rewards switching when pressure differential is genuinely high"
+  components:
+    throughput_bonus:
+      formula: "w_throughput * (vehicles_cleared / max_possible_clearance_this_step)"
+      range: "[0, ~+1.2]"
+      description: >
+        Normalised throughput. max_possible = sat_flow * active_green_lanes.
+        Reward is in [0,1] regardless of how many lanes are green.
+    queue_delta_reward:
+      formula: "w_wait * clip((prev_queue - curr_queue) / (n_lanes * capacity), -1, 1)"
+      range: "[-0.8, +0.8]"
+      description: >
+        Rewards actively draining queues, penalises growing them. Delta-based
+        so agent gets positive signal for every vehicle it clears beyond arrivals.
+    congestion_pressure:
+      formula: "-0.3 * (occupancy_rate ** 2)"
+      range: "[-0.3, 0]"
+      description: Quadratic background penalty for sustained high occupancy only.
+    starvation_penalty:
+      formula: "w_fairness * max_deviation(main_through_lane_occupancies)"
+      range: "[-0.5, 0]"
+      description: >
+        Max-deviation of the 4 main through-lanes from their mean occupancy.
+        Much more sensitive than variance for catching a single starved approach.
+        Only activates when queue occupancy exceeds 40%.
+    switch_penalty:
+      formula: "w_switch * [1.0 if premature+unjustified | 0.3 if premature+justified | 0 otherwise]"
+      range: "[-0.25, 0]"
+      description: >
+        Context-aware. Premature = < 15 steps elapsed. Justified = pressure diff > 0.25.
+        FORCE_ALL_RED is never penalised — it's a legitimate safety action.
+    spillback_severity:
+      formula: "w_spillback * mean(max(0, (occ - 0.85)/0.15) for each lane)"
+      range: "[-0.85, 0]"
+      description: Escalating penalty per lane based on depth into spillback zone.
+    gridlock_cliff:
+      formula: "-8.0 * fraction_of_gridlocked_lanes"
+      range: "[-8.0, 0]"
+      description: Scaled cliff — proportional to how many lanes are simultaneously jammed.
+    proactive_bonus:
+      formula: "0.2 * pressure_diff if (switched AND pressure_diff > 0.3)"
+      range: "[0, +0.2]"
+      description: Bonus for switching phase when incoming approach has much higher pressure.
+
+# ─────────────────────────────────────────────
+# Tasks
+# ─────────────────────────────────────────────
+tasks:
+  - id: task_suburban_steady
+    name: Suburban Steady Flow
+    difficulty: easy
+    horizon: 600
+    description: >
+      Low, symmetric, near-deterministic arrivals. Optimal policy is
+      fair green time allocation. Good baseline for verifying signal logic.
+    grader: weighted_composite
+    score_range: [0.0, 1.0]
+    expected_baseline_score: 0.55
+
+  - id: task_urban_stochastic
+    name: Urban Stochastic Rush
+    difficulty: medium
+    horizon: 1200
+    description: >
+      Bursty, asymmetric inflows with stochastic lambda perturbation.
+      Requires adaptive timing and predictive reasoning.
+    grader: weighted_composite
+    score_range: [0.0, 1.0]
+    expected_baseline_score: 0.42
+
+  - id: task_rush_hour_crisis
+    name: Rush Hour Crisis
+    difficulty: hard
+    horizon: 1800
+    description: >
+      Maximum load scenario: rain, blocked lane, near-saturation arrivals,
+      congestion cascade risk. Agent must survive gridlock and maintain
+      minimum viable throughput.
+    grader: weighted_composite
+    score_range: [0.0, 1.0]
+    expected_baseline_score: 0.30
+
+# ─────────────────────────────────────────────
+# Episode Configuration
+# ─────────────────────────────────────────────
+episode:
+  termination_conditions:
+    - horizon_reached: "step_count >= horizon"
+    - sustained_gridlock: "gridlock_steps >= 20 AND is_gridlock"
+  reset: stochastic_seed_or_fixed
+  seeding: supported
+
+# ─────────────────────────────────────────────
+# API Endpoints
+# ─────────────────────────────────────────────
+api:
+  framework: FastAPI
+  base_url: "/"
+  endpoints:
+    - path: /reset
+      method: POST
+      description: Initialize new episode session
+    - path: /step
+      method: POST
+      description: Apply action, advance simulation
+    - path: /state
+      method: GET
+      description: Current full environment state
+    - path: /tasks
+      method: GET
+      description: List all tasks with action/observation schemas
+    - path: /grader
+      method: POST
+      description: Compute episode score [0,1]
+    - path: /baseline
+      method: POST
+      description: Run baseline policy evaluation
+    - path: /viz
+      method: GET
+      description: Live visualisation dashboard
+    - path: /health
+      method: GET
+      description: Service health check
+
+# ─────────────────────────────────────────────
+# Deployment
+# ─────────────────────────────────────────────
+deployment:
+  platform: "Hugging Face Docker Space"
+  framework: "FastAPI + Uvicorn"
+  port: 7860
+  health_endpoint: /health
+
+# ─────────────────────────────────────────────
+# References
+# ─────────────────────────────────────────────
+references:
+  - "Varaiya, P. (2013). Max pressure control of a network of signalized intersections."
+  - "Webster, F.V. (1958). Traffic signal settings. Road Research Technical Paper No. 39."
+  - "Sutton, R.S. & Barto, A.G. (2018). Reinforcement Learning: An Introduction. 2nd ed."
+  - "Lowrie, P.R. (1990). SCATS - Sydney Coordinated Adaptive Traffic System."
