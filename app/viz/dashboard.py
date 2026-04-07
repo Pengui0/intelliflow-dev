@@ -3273,6 +3273,29 @@ document.addEventListener('fullscreenchange', function() {
   }
 });
 </script>
+window.addEventListener("load", async () => {
+  try {
+    const res = await fetch(window.location.origin + "/load_weights");
+    const data = await res.json();
+
+    if (data.found) {
+      console.log("Loaded pretrained weights");
+
+      if (window.dqnAgent) {
+        window.dqnAgent.load(data.data);
+      }
+
+      // update UI directly
+      document.getElementById("rl-episodes").textContent = data.data.episodes || 60;
+      document.getElementById("rl-epsilon").textContent = data.data.epsilon?.toFixed(3) || "0.050";
+
+    } else {
+      console.log("No weights found");
+    }
+  } catch (e) {
+    console.error("Load weights error:", e);
+  }
+});
 </body>
 </html>"""
 
