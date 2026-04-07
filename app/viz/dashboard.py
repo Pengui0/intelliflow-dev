@@ -898,9 +898,9 @@ var DQN = {
   GAMMA: 0.95,
   LR: 0.0005,
   EPSILON: 1.0,
-  EPS_MIN: 0.08,
-  EPS_DECAY: 0.9992,
-  TARGET_UPDATE_FREQ: 50,
+  EPS_MIN: 0.05,
+  EPS_DECAY: 0.9985,
+  TARGET_UPDATE_FREQ: 200,
   trainSteps: 0,
   totalSteps: 0,
   episodes: 0,
@@ -1007,7 +1007,7 @@ var DQN = {
     return state;
   },
 
-  computeReward: function(info, prevInfo) {
+  .computeReward: function(info, prevInfo) {
     if (!info) return 0;
     var r = 0;
     var cleared  = info.step_cleared || 0;
@@ -1019,34 +1019,34 @@ var DQN = {
     var spill    = info.spillback_count || 0;
 
     // Primary signal: throughput
-    r += cleared * 3.0;
+    r += cleared * 2.0;
 
     // Penalise waiting vehicles — mild, linear
-    r -= totalQ * 0.08;
+    r -= totalQ * 0.05;
 
-    // Penalise delay strongly — this is the HCM objective
-    r -= delay * 0.4;
+    // Penalise delay — capped so it never drowns throughput signal
+    r -= Math.min(delay * 0.1, 5.0);
 
     // Penalise imbalance — encourages fair service
-    r -= Math.abs(nsQ - ewQ) * 0.05;
+    r -= Math.abs(nsQ - ewQ) * 0.03;
 
     // Safety
-    r -= crashes * 10.0;
+    r -= crashes * 8.0;
 
     // Spillback
-    r -= spill * 0.3;
+    r -= spill * 0.2;
 
     // LOS bonus/penalty — small, to guide but not dominate
     var los = info.los || '';
-    if      (los === 'A') r += 1.0;
-    else if (los === 'B') r += 0.5;
+    if      (los === 'A') r += 0.8;
+    else if (los === 'B') r += 0.4;
     else if (los === 'C') r += 0.0;
-    else if (los === 'D') r -= 0.5;
-    else if (los === 'E') r -= 1.2;
-    else if (los === 'F') r -= 2.5;
+    else if (los === 'D') r -= 0.3;
+    else if (los === 'E') r -= 0.7;
+    else if (los === 'F') r -= 1.5;
 
     // Penalise needless phase switches (action=1) when queues are short
-    if (this.lastAction === 1 && totalQ < 4) r -= 1.5;
+    if (this.lastAction === 1 && totalQ < 4) r -= 1.0;
 
     return r;
   },
@@ -3281,48 +3281,6 @@ document.addEventListener('fullscreenchange', function() {
     b.style.color = 'var(--text-dim)';
   }
 });
-
-window.addEventListener("load", async () => {
-  try {
-    const res = await fetch(window.location.origin + "/load_weights");
-    const data = await res.json();
-
-    if (data.found) {
-      console.log("Loaded pretrained weights");
-
-      setTimeout(() => {
-        if (data.found && DQN) {
-          if (DQN.online && data.data.online) {
-            DQN.online.weights = data.data.online.weights;
-            DQN.online.weights = data.data.online.weights;
-          }
-
-          if (DQN.target && data.data.target) {
-            DQN.target.weights = data.data.target.weights;
-            DQN.target.biases = data.data.target.biases;
-          }
-
-          DQN.EPSILON = data.data.epsilon;
-          DQN.trainSteps = data.data.trainSteps || 0;
-          console.log("✅ Weights applied to DQN");
-        } else {
-          console.log("⚠️ No weights or DQN missing");
-        }
-      }, 500);
-
-
-      // update UI directly
-      document.getElementById("rl-episodes").textContent = data.data.episodes || 60;
-      document.getElementById("rl-epsilon").textContent = data.data.epsilon?.toFixed(3) || "0.050";
-
-    } else {
-      console.log("No weights found");
-    }
-  } catch (e) {
-    console.error("Load weights error:", e);
-  }
-});
-
 </script>
 </body>
 </html>"""
