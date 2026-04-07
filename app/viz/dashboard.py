@@ -959,10 +959,9 @@ var DQN = {
 
   loadModel: async function() {
     try {
-      var resp = await fetch('/load_weights');
+      var resp = await fetch('https://raw.githubusercontent.com/Pengui0/IntelliFlow-openenv/main/dqn_weights.json');
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       var json = await resp.json();
-      if (!json.found || !json.data) return false;
       var d = json.data;
       this.online        = QNetwork.fromJSON(d.online);
       this.target        = QNetwork.fromJSON(d.target);
