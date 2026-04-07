@@ -3280,14 +3280,21 @@ window.addEventListener("load", async () => {
 
     if (data.found) {
       console.log("Loaded pretrained weights");
-      
+
       setTimeout(() => {
         if (data.found && DQN) {
-          DQN.online = data.data.online;
-          DQN.target = data.data.target;
+          if (DQN.online && data.data.online) {
+            DQN.online.weights = data.data.online.weights;
+            DQN.online.weights = data.data.online.weights;
+          }
+
+          if (DQN.target && data.data.target) {
+            DQN.target.weights = data.data.target.weights;
+            DQN.target.biases = data.data.target.biases;
+          }
+
           DQN.EPSILON = data.data.epsilon;
           DQN.trainSteps = data.data.trainSteps || 0;
-
           console.log("✅ Weights applied to DQN");
         } else {
           console.log("⚠️ No weights or DQN missing");
