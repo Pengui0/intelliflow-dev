@@ -3272,7 +3272,7 @@ document.addEventListener('fullscreenchange', function() {
     b.style.color = 'var(--text-dim)';
   }
 });
-</script>
+
 window.addEventListener("load", async () => {
   try {
     const res = await fetch(window.location.origin + "/load_weights");
@@ -3296,6 +3296,8 @@ window.addEventListener("load", async () => {
     console.error("Load weights error:", e);
   }
 });
+
+</script>
 </body>
 </html>"""
 
