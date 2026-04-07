@@ -900,7 +900,7 @@ var DQN = {
   EPSILON: 1.0,
   EPS_MIN: 0.05,
   EPS_DECAY: 0.9985,
-  TARGET_UPDATE_FREQ: 200,
+  TARGET_UPDATE_FREQ: 50,
   trainSteps: 0,
   totalSteps: 0,
   episodes: 0,
@@ -994,9 +994,9 @@ var DQN = {
     var ph = obs.phase_onehot || [1, 0, 0, 0];
     var sp = obs.spillback_flags || [];
     var state = new Float32Array(57);
-    for(var i=0;i<12;i++) state[i]    = Math.min((ql[i]||0)/15.0, 1.0);
-    for(var i=0;i<12;i++) state[12+i] = Math.min((tp[i]||0)/8.0,  1.0);
-    for(var i=0;i<12;i++) state[24+i] = Math.min((ai[i]||0)/5.0,  1.0);
+    for(var i=0;i<12;i++) state[i]    = Math.min((ql[i]||0),1.0);
+    for(var i=0;i<12;i++) state[12+i] = Math.min((tp[i]||0),1.0);
+    for(var i=0;i<12;i++) state[24+i] = Math.min((ai[i]||0),1.0);
     for(var i=0;i<4;i++)  state[36+i] = ph[i]||0;
     state[40] = obs.phase_elapsed_norm||0;
     state[41] = obs.fairness_score||0;
@@ -1007,47 +1007,38 @@ var DQN = {
     return state;
   },
 
-  .computeReward: function(info, prevInfo) {
+  computeReward: function(info, prevInfo) {
     if (!info) return 0;
     var r = 0;
-    var cleared  = info.step_cleared || 0;
-    var nsQ      = info.ns_queue || 0;
-    var ewQ      = info.ew_queue || 0;
-    var totalQ   = nsQ + ewQ;
-    var delay    = info.avg_delay || 0;
-    var crashes  = info.step_crashes || 0;
-    var spill    = info.spillback_count || 0;
-
-    // Primary signal: throughput
+    var cleared = info.step_cleared || 0;
     r += cleared * 2.0;
-
-    // Penalise waiting vehicles — mild, linear
-    r -= totalQ * 0.05;
-
-    // Penalise delay — capped so it never drowns throughput signal
-    r -= Math.min(delay * 0.1, 5.0);
-
-    // Penalise imbalance — encourages fair service
+    var nsQ = info.ns_queue || 0;
+    var ewQ = info.ew_queue || 0;
+    var totalQ = nsQ + ewQ;
+    r -= totalQ * 0.15;
+    r -= Math.pow(totalQ, 1.4) * 0.002;
     r -= Math.abs(nsQ - ewQ) * 0.03;
-
-    // Safety
-    r -= crashes * 8.0;
-
-    // Spillback
-    r -= spill * 0.2;
-
-    // LOS bonus/penalty — small, to guide but not dominate
+    r -= (info.avg_delay || 0) * 0.3;
     var los = info.los || '';
-    if      (los === 'A') r += 0.8;
-    else if (los === 'B') r += 0.4;
-    else if (los === 'C') r += 0.0;
-    else if (los === 'D') r -= 0.3;
-    else if (los === 'E') r -= 0.7;
-    else if (los === 'F') r -= 1.5;
-
-    // Penalise needless phase switches (action=1) when queues are short
-    if (this.lastAction === 1 && totalQ < 4) r -= 1.0;
-
+    if      (los === 'A') r += 1.5;
+    else if (los === 'B') r += 0.8;
+    else if (los === 'C') r += 0.2;
+    else if (los === 'D') r -= 0.2;
+    else if (los === 'E') r -= 0.8;
+    else if (los === 'F') r -= 2.0;
+    r -= (info.step_crashes || 0) * 8.0;
+    r -= (info.spillback_count || 0) * 0.5;
+    var totalQ = (info.ns_queue || 0) + (info.ew_queue || 0);
+    if (this.lastAction === 3) {
+      r += (info.spillback_count || 0) > 3 ? 0.5 : -0.4;
+    }
+    if (this.lastAction === 4) {
+      r += totalQ < 8 ? 0.3 : -0.3;
+    }
+    if (prevInfo && info.phase !== prevInfo.phase && cleared === 0 && totalQ < 3) r -= 0.5;
+    if (cleared === 0 && totalQ > 5) r -= 0.3;
+    var currentTask = document.getElementById('task-sel').value;
+    if (this.lastAction === 1 && totalQ < 6 && currentTask === 'task_suburban_steady') r -= 3.0;
     return r;
   },
 
@@ -1081,9 +1072,9 @@ var DQN = {
 
     this.totalSteps++;
     this.rollingReward = 0.95 * this.rollingReward + 0.05 * reward;
-    if(this.trainSteps > 15000) this.LR = 0.0002;
-    if(this.trainSteps > 25000) this.LR = 0.0001;
-    
+    if(this.trainSteps > 5000) this.LR = 0.0001;
+    if(this.trainSteps > 8000) this.LR = 0.00005;
+
     if (this.replay.length >= this.BATCH_SIZE) {
       this.trainBatch();
     }
@@ -1165,7 +1156,7 @@ var DQN = {
 
     if (this.lastQVals) {
       var bestA = 0;
-      for (var i = 1; i < 5; i++) if (this.lastQVals[i] > this.lastQVals[bestA]) bestA = i;
+      for (var i = 1; i < 3; i++) if (this.lastQVals[i] > this.lastQVals[bestA]) bestA = i;
       var qNames = ['rl-q0','rl-q1','rl-q2','rl-q3','rl-q4'];
       qNames.forEach(function(id, i) {
         var e = document.getElementById(id); if (!e) return;
@@ -3281,6 +3272,49 @@ document.addEventListener('fullscreenchange', function() {
     b.style.color = 'var(--text-dim)';
   }
 });
+
+window.addEventListener("load", async () => {
+  try {
+    const res = await fetch(window.location.origin + "/load_weights");
+    const data = await res.json();
+
+    if (data.found) {
+      console.log("Loaded pretrained weights");
+
+      setTimeout(() => {
+        if (data.found && DQN) {
+          if (DQN.online && data.data.online) {
+            DQN.online.weights = data.data.online.weights;
+            DQN.online.weights = data.data.online.weights;
+          }
+
+          if (DQN.target && data.data.target) {
+            DQN.target.weights = data.data.target.weights;
+            DQN.target.biases = data.data.target.biases;
+          }
+
+          DQN.EPSILON = data.data.epsilon;
+          DQN.trainSteps = data.data.trainSteps || 0;
+
+          console.log("✅ Weights applied to DQN");
+        } else {
+          console.log("⚠️ No weights or DQN missing");
+        }
+      }, 500);
+
+
+      // update UI directly
+      document.getElementById("rl-episodes").textContent = data.data.episodes || 60;
+      document.getElementById("rl-epsilon").textContent = data.data.epsilon?.toFixed(3) || "0.050";
+
+    } else {
+      console.log("No weights found");
+    }
+  } catch (e) {
+    console.error("Load weights error:", e);
+  }
+});
+
 </script>
 </body>
 </html>"""
