@@ -966,8 +966,10 @@ var DQN = {
       this.online        = QNetwork.fromJSON(d.online);
       this.target        = QNetwork.fromJSON(d.target);
       this.EPSILON       = typeof d.epsilon      === 'number' ? d.epsilon      : 1.0;
-      this.trainSteps    = d.trainSteps    || 0;
-      this.totalSteps    = d.totalSteps    || 0;
+      this.trainSteps = d.trainSteps ?? 10000;
+      this.totalSteps = d.totalSteps ?? 10000;
+      this.loadedFromWeights = true;
+      this.trainingEnabled = false;
       this.episodes      = d.episodes      || 0;
       this.lossHist      = d.lossHist      || [];
       this.rollingReward = d.rollingReward || 0;
@@ -1074,7 +1076,7 @@ var DQN = {
     if(this.trainSteps > 5000) this.LR = 0.0001;
     if(this.trainSteps > 8000) this.LR = 0.00005;
 
-    if (this.replay.length >= this.BATCH_SIZE) {
+    if (this.trainingEnabled && this.replay.length >= this.BATCH_SIZE) {
       this.trainBatch();
     }
 
