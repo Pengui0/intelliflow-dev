@@ -265,6 +265,7 @@ def run_episode(
 
     t_start = time.time()
 
+    print(f"[START] task={task_id} env=intelliflow model={MODEL_NAME or policy_name}", flush=True)
     while not done:
         action = policy.act(obs)
         step_data = client.step(session_id, action)
@@ -277,6 +278,7 @@ def run_episode(
         total_reward += reward
         rewards.append(reward)
         step_count += 1
+        print(f"[STEP] step={step_count} action={json.dumps(action)} reward={reward:.2f} done={str(done).lower()} error=null", flush=True)
 
         if verbose and step_count % 100 == 0:
             print(f"  Step {step_count:4d}/{horizon} | "
@@ -287,8 +289,11 @@ def run_episode(
 
     elapsed = time.time() - t_start
 
+    grade_data = client.grade(session_id)   # this line already exists below, don't duplicate
+
     # Grade
     grade_data = client.grade(session_id)
+    print(f"[END] success=true steps={step_count} score={grade_data.get('score', 0.0):.3f} rewards={','.join(f'{r:.3f}' for r in rewards)}", flush=True)
 
     result = {
         "task_id": task_id,
