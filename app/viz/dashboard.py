@@ -3006,9 +3006,7 @@ var BATTLE = {
       var fixedAction = Math.floor(this.fixedTimer / this.FIXED_CYCLE) % 2 === 0 ? 0 : 1;
       promises.push(
         fetch(BASE+'/step',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({session_id:this.fixedSessionId,action:fixedAction})})
-        .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
-        .catch(e=>{log('Battle step err: '+e.message,'err');return null;})
+          body:JSON.stringify({session_id:this.fixedSessionId,action:fixedAction})}).then(r=>r.json()).catch(e=>{log('Step err:'+e.message,'err');return null;})
       );
     } else { promises.push(Promise.resolve(null)); }
 
@@ -3026,9 +3024,7 @@ var BATTLE = {
       }
       promises.push(
         fetch(BASE+'/step',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({session_id:this.aiSessionId,action:aiAction})})
-        .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
-        .catch(e=>{log('Battle step err: '+e.message,'err');return null;})
+          body:JSON.stringify({session_id:this.aiSessionId,action:aiAction})}).then(r=>r.json()).catch(e=>{log('Step err:'+e.message,'err');return null;})
       );
     } else { promises.push(Promise.resolve(null)); }
 
