@@ -3272,49 +3272,6 @@ document.addEventListener('fullscreenchange', function() {
     b.style.color = 'var(--text-dim)';
   }
 });
-
-window.addEventListener("load", async () => {
-  try {
-    const res = await fetch(window.location.origin + "/load_weights");
-    const data = await res.json();
-
-    if (data.found) {
-      console.log("Loaded pretrained weights");
-
-      setTimeout(() => {
-        if (data.found && DQN) {
-          if (DQN.online && data.data.online) {
-            DQN.online.weights = data.data.online.weights;
-            DQN.online.weights = data.data.online.weights;
-          }
-
-          if (DQN.target && data.data.target) {
-            DQN.target.weights = data.data.target.weights;
-            DQN.target.biases = data.data.target.biases;
-          }
-
-          DQN.EPSILON = data.data.epsilon;
-          DQN.trainSteps = data.data.trainSteps || 0;
-
-          console.log("✅ Weights applied to DQN");
-        } else {
-          console.log("⚠️ No weights or DQN missing");
-        }
-      }, 500);
-
-
-      // update UI directly
-      document.getElementById("rl-episodes").textContent = data.data.episodes || 60;
-      document.getElementById("rl-epsilon").textContent = data.data.epsilon?.toFixed(3) || "0.050";
-
-    } else {
-      console.log("No weights found");
-    }
-  } catch (e) {
-    console.error("Load weights error:", e);
-  }
-});
-
 </script>
 </body>
 </html>"""
