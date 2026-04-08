@@ -962,7 +962,7 @@ var DQN = {
       var resp = await fetch('/load_weights');
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       var json = await resp.json();
-      if (!json.found || !json.data) throw new Error('not found');
+      if (!json.found || !json.data) return false;
       var d = json.data;
       this.online        = QNetwork.fromJSON(d.online);
       this.target        = QNetwork.fromJSON(d.target);
@@ -975,25 +975,7 @@ var DQN = {
       rlLog('Model restored from server · ε=' + this.EPSILON.toFixed(3) + ' · episodes=' + this.episodes + ' · steps=' + this.totalSteps, 'ok');
       return true;
     } catch(e) {
-      rlLog('Server weights not found — trying GitHub fallback…', 'warn');
-    }
-    try {
-      var resp2 = await fetch('https://raw.githubusercontent.com/Pengui0/IntelliFlow-openenv/refs/heads/main/app/api/dqn_weights.json');
-      if (!resp2.ok) throw new Error('HTTP ' + resp2.status);
-      var d = await resp2.json();
-      if (!d.online) throw new Error('bad payload');
-      this.online        = QNetwork.fromJSON(d.online);
-      this.target        = QNetwork.fromJSON(d.target);
-      this.EPSILON       = typeof d.epsilon      === 'number' ? d.epsilon      : 1.0;
-      this.trainSteps    = d.trainSteps    || 0;
-      this.totalSteps    = d.totalSteps    || 0;
-      this.episodes      = d.episodes      || 0;
-      this.lossHist      = d.lossHist      || [];
-      this.rollingReward = d.rollingReward || 0;
-      rlLog('Model restored from GitHub · ε=' + this.EPSILON.toFixed(3) + ' · episodes=' + this.episodes + ' · steps=' + this.totalSteps, 'ok');
-      return true;
-    } catch(e2) {
-      rlLog('No saved model anywhere — starting fresh', 'warn');
+      rlLog('No saved model on server — starting fresh', 'warn');
       return false;
     }
   },
@@ -2815,7 +2797,6 @@ async function doReset() {
   updateRing(0);drawSparkline();drawAllTrendCharts();
   DQN.lastState = null;
   DQN.lastAction = null;
-  DQN._prevPrevInfo = null;
   log('Episode started · '+task+' · '+d.session_id.slice(0,10)+'…','ok');return d;
 }
 async function doStep(action){if(!sessionId)return null;var r=await fetch(BASE+'/step',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sessionId,action:action})});return r.json();}
@@ -2878,7 +2859,6 @@ function pressureAction(obs) {
 }
 
 function dqnPolicy(obs, prevInfo) {
-  if (DQN._prevPrevInfo === undefined) DQN._prevPrevInfo = null;
   if (DQN.lastState !== null && prevInfo !== null) {
     var reward = DQN.computeReward(prevInfo, DQN._prevPrevInfo || null);
     DQN.step(obs, reward, false);
