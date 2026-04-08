@@ -43,8 +43,7 @@ DEFAULT_HOST = os.environ.get("INTELLIFLOW_HOST", "http://localhost:7860")
 API_BASE_URL = os.environ.get("API_BASE_URL")
 MODEL_NAME   = os.environ.get("MODEL_NAME", "gpt-4o-mini")
 HF_TOKEN     = os.environ.get("HF_TOKEN")
-API_KEY = os.environ.get("API_KEY", "")
-OPENAI_API_KEY = API_KEY  # backwards compat
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 TASKS = [
     "task_suburban_steady",
     "task_urban_stochastic",
