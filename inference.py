@@ -141,8 +141,8 @@ class LLMPolicy:
         try:
             import openai
             self._client = openai.OpenAI(
-                api_key=os.environ["API_KEY"],
-                base_url=os.environ["API_BASE_URL"],
+                api_key=os.environ.get("API_KEY") or os.environ.get("OPENAI_API_KEY", ""),
+                base_url=os.environ.get("API_BASE_URL") or None,
             )
             self._available = True
         except ImportError:
@@ -150,7 +150,7 @@ class LLMPolicy:
             self._available = False
 
     def act(self, obs: Dict) -> int:
-        if not self._available or not os.environ.get("API_KEY"):
+        if not self._available:
             return self._fallback.act(obs)
 
         try:
@@ -331,9 +331,9 @@ def main():
         help="Task ID or 'all' (default: all)"
     )
     parser.add_argument(
-        "--policy", default="pressure",
+        "--policy", default="llm",
         choices=["pressure", "fixed_cycle", "random", "llm"],
-        help="Policy to evaluate (default: pressure)"
+        help="Policy to evaluate (default: llm)"
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
