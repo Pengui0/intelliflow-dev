@@ -962,7 +962,7 @@ var DQN = {
       var resp = await fetch('/load_weights');
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       var json = await resp.json();
-      if (!json.found || !json.data) return false;
+      if (!json.found || !json.data) throw new Error('not found');
       var d = json.data;
       this.online        = QNetwork.fromJSON(d.online);
       this.target        = QNetwork.fromJSON(d.target);
@@ -975,7 +975,25 @@ var DQN = {
       rlLog('Model restored from server · ε=' + this.EPSILON.toFixed(3) + ' · episodes=' + this.episodes + ' · steps=' + this.totalSteps, 'ok');
       return true;
     } catch(e) {
-      rlLog('No saved model on server — starting fresh', 'warn');
+      rlLog('Server weights not found — trying GitHub fallback…', 'warn');
+    }
+    try {
+      var resp2 = await fetch('https://raw.githubusercontent.com/Pengui0/IntelliFlow-openenv/refs/heads/main/app/api/dqn_weights.json');
+      if (!resp2.ok) throw new Error('HTTP ' + resp2.status);
+      var d = await resp2.json();
+      if (!d.online) throw new Error('bad payload');
+      this.online        = QNetwork.fromJSON(d.online);
+      this.target        = QNetwork.fromJSON(d.target);
+      this.EPSILON       = typeof d.epsilon      === 'number' ? d.epsilon      : 1.0;
+      this.trainSteps    = d.trainSteps    || 0;
+      this.totalSteps    = d.totalSteps    || 0;
+      this.episodes      = d.episodes      || 0;
+      this.lossHist      = d.lossHist      || [];
+      this.rollingReward = d.rollingReward || 0;
+      rlLog('Model restored from GitHub · ε=' + this.EPSILON.toFixed(3) + ' · episodes=' + this.episodes + ' · steps=' + this.totalSteps, 'ok');
+      return true;
+    } catch(e2) {
+      rlLog('No saved model anywhere — starting fresh', 'warn');
       return false;
     }
   },
@@ -983,7 +1001,23 @@ var DQN = {
   maybeSave: function() {
     if (this.trainSteps > 0 && this.trainSteps % 50 === 0) {
       this.saveModel();
+      this.saveLocal();
     }
+  },
+
+  saveLocal: function() {
+    try {
+      var payload = {
+        online: this.online.toJSON(),
+        target: this.target.toJSON(),
+        epsilon: this.EPSILON,
+        trainSteps: this.trainSteps,
+        episodes: this.episodes,
+        rollingReward: this.rollingReward,
+        lossHist: this.lossHist.slice(-120)
+      };
+      localStorage.setItem('dqn-weights-v1', JSON.stringify(payload));
+    } catch(e) { console.warn('localStorage save failed:', e); }
   },
 
   extractState: function(obs) {
@@ -2781,6 +2815,7 @@ async function doReset() {
   updateRing(0);drawSparkline();drawAllTrendCharts();
   DQN.lastState = null;
   DQN.lastAction = null;
+  DQN._prevPrevInfo = null;
   log('Episode started · '+task+' · '+d.session_id.slice(0,10)+'…','ok');return d;
 }
 async function doStep(action){if(!sessionId)return null;var r=await fetch(BASE+'/step',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:sessionId,action:action})});return r.json();}
@@ -2843,6 +2878,7 @@ function pressureAction(obs) {
 }
 
 function dqnPolicy(obs, prevInfo) {
+  if (DQN._prevPrevInfo === undefined) DQN._prevPrevInfo = null;
   if (DQN.lastState !== null && prevInfo !== null) {
     var reward = DQN.computeReward(prevInfo, DQN._prevPrevInfo || null);
     DQN.step(obs, reward, false);
@@ -2898,6 +2934,7 @@ function applySimSpeed() {
           DQN.updateUI();
           rlLog('Episode done. Replay:'+DQN.replay.length+' ε:'+DQN.EPSILON.toFixed(3)+' steps:'+DQN.totalSteps);
           DQN.saveModel();
+          DQN.saveLocal();
         }
         await doGrade();
         if(sd.info) updateSummaryCard(sd.info);
@@ -2934,7 +2971,7 @@ document.getElementById('btn-run').addEventListener('click',async function() {
 document.getElementById('btn-stop').addEventListener('click',function() {
   running=false;paused=true;if(runInterval){clearInterval(runInterval);runInterval=null;}
   document.getElementById('status-txt').textContent='Stopped.';log('Policy stopped.','warn');
-  if(opMode==='rl') DQN.saveModel();
+  if(opMode==='rl') { DQN.saveModel(); DQN.saveLocal(); }
 });
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -3237,7 +3274,26 @@ document.getElementById('btn-battle-stop').addEventListener('click',  () => BATT
   DQN.target.copyWeightsFrom(DQN.online);
   var restored = await DQN.loadModel();
   if (!restored) {
-    DQN.init();
+    var localWeights = localStorage.getItem('dqn-weights-v1');
+    if (localWeights) {
+      try {
+        var parsed = JSON.parse(localWeights);
+        DQN.online = QNetwork.fromJSON(parsed.online);
+        DQN.target = QNetwork.fromJSON(parsed.target);
+        DQN.EPSILON = parsed.epsilon || 1.0;
+        DQN.trainSteps = parsed.trainSteps || 0;
+        DQN.episodes = parsed.episodes || 0;
+        DQN.rollingReward = parsed.rollingReward || 0;
+        DQN.lossHist = parsed.lossHist || [];
+        DQN.updateUI();
+        rlLog('Weights restored from browser localStorage', 'ok');
+        restored = true;
+      } catch(e) {
+        DQN.init();
+      }
+    } else {
+      DQN.init();
+    }
   } else {
     DQN.updateUI();
   }
