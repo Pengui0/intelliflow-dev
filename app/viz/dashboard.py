@@ -2988,99 +2988,85 @@ var BATTLE = {
     this._aiLastObs = null;
     this.fixedStep = 0;
     this.aiStep = 0;
-    this.interval = setInterval(() => this.tick(), 400);
+    this.interval = setInterval(() => this.tick(), 160);
   },
 
-async tick() {
-  if (!this.running) return;
-  var done1 = this.fixed.step >= this.horizon;
-  var done2 = this.ai.step    >= this.horizon;
-  if (done1 && done2) { this.finish(); return; }
+  async tick() {
+    if (!this.running) return;
+    var done1 = this.fixed.step >= this.horizon;
+    var done2 = this.ai.step    >= this.horizon;
+    if (done1 && done2) { this.finish(); return; }
 
-  this._errCount = this._errCount || 0;
+    // Track consecutive errors
+    this._errCount = this._errCount || 0;
 
-  let fixedSd = null;
-  let aiSd = null;
+    var promises = [];
 
-  // Step 1: Fixed timer (always first)
-  if (!done1) {
-    this.fixedTimer++;
-    var fixedAction = Math.floor(this.fixedTimer / this.FIXED_CYCLE) % 2 === 0 ? 0 : 1;
-    try {
-      const res = await fetch(BASE + '/step', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: this.fixedSessionId, action: fixedAction })
-      });
-      if (res.ok) fixedSd = await res.json();
-      else throw new Error('HTTP ' + res.status);
-    } catch(e) {
-      log('Fixed step error: ' + e.message, 'err');
-      fixedSd = null;
+    if (!done1) {
+      this.fixedTimer++;
+      var fixedAction = Math.floor(this.fixedTimer / this.FIXED_CYCLE) % 2 === 0 ? 0 : 1;
+      promises.push(
+        fetch(BASE+'/step',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({session_id:this.fixedSessionId,action:fixedAction})})
+        .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+        .catch(e=>{log('Battle step err: '+e.message,'err');return null;})
+      );
+    } else { promises.push(Promise.resolve(null)); }
+
+    if (!done2) {
+      var aiAction = 0;
+      if (DQN.online) {
+        var tmpState = DQN.extractState(this._aiLastObs || null);
+        var qv = DQN.online.forward(tmpState);
+        var rawA = 0;
+        for(var i=1;i<5;i++) if(qv[i]>qv[rawA]) rawA=i;
+        aiAction = rawA;
+      }
+      promises.push(
+        fetch(BASE+'/step',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({session_id:this.aiSessionId,action:aiAction})})
+        .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+        .catch(e=>{log('Battle step err: '+e.message,'err');return null;})
+      );
+    } else { promises.push(Promise.resolve(null)); }
+
+    var [fixedSd, aiSd] = await Promise.all(promises);
+
+    // If both returned null (errors), increment error count and stop if too many
+    if (!fixedSd && !aiSd) {
+      this._errCount++;
+      if (this._errCount > 5) {
+        log('Battle aborted — too many consecutive errors', 'err');
+        this.stop(); return;
+      }
+    } else {
+      this._errCount = 0;
     }
-  }
 
-  // Step 2: AI step (only if fixed step succeeded or we ignore)
-  if (!done2) {
-    let aiAction = 0;
-    if (DQN.online) {
-      var tmpState = DQN.extractState(this._aiLastObs || null);
-      var qv = DQN.online.forward(tmpState);
-      let bestA = 0;
-      for (let i = 1; i < 5; i++) if (qv[i] > qv[bestA]) bestA = i;
-      aiAction = bestA;
+    if (fixedSd) {
+      this.fixed.step = fixedSd.step || 0;
+      var fi = fixedSd.info || {};
+      this.fixed.cleared = fi.total_cleared || 0;
+      if (fi.avg_delay > 0) { this.fixed.totalWait += fi.avg_delay; this.fixed.waitCount++; }
+      if (fi.los) this.fixed.los = fi.los;
+      this.fixedQHist.push((fi.ns_queue||0)+(fi.ew_queue||0));
+      if (this.fixedQHist.length > 120) this.fixedQHist.shift();
     }
-    try {
-      const res = await fetch(BASE + '/step', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: this.aiSessionId, action: aiAction })
-      });
-      if (res.ok) aiSd = await res.json();
-      else throw new Error('HTTP ' + res.status);
-    } catch(e) {
-      log('AI step error: ' + e.message, 'err');
-      aiSd = null;
+
+    if (aiSd) {
+      this._aiLastObs = aiSd.observation;
+      this.ai.step = aiSd.step || 0;
+      var ai = aiSd.info || {};
+      this.ai.cleared = ai.total_cleared || 0;
+      if (ai.avg_delay > 0) { this.ai.totalWait += ai.avg_delay; this.ai.waitCount++; }
+      if (ai.los) this.ai.los = ai.los;
+      this.aiQHist.push((ai.ns_queue||0)+(ai.ew_queue||0));
+      if (this.aiQHist.length > 120) this.aiQHist.shift();
     }
-  }
 
-  // Error counting
-  if (!fixedSd && !aiSd) {
-    this._errCount++;
-    if (this._errCount > 5) {
-      log('Battle aborted — too many errors', 'err');
-      this.stop(); return;
-    }
-  } else {
-    this._errCount = 0;
-  }
-
-  // Process responses (same as before)
-  if (fixedSd) {
-    this.fixed.step = fixedSd.step || 0;
-    var fi = fixedSd.info || {};
-    this.fixed.cleared = fi.total_cleared || 0;
-    if (fi.avg_delay > 0) { this.fixed.totalWait += fi.avg_delay; this.fixed.waitCount++; }
-    if (fi.los) this.fixed.los = fi.los;
-    this.fixedQHist.push((fi.ns_queue||0)+(fi.ew_queue||0));
-    if (this.fixedQHist.length > 120) this.fixedQHist.shift();
-  }
-
-  if (aiSd) {
-    this._aiLastObs = aiSd.observation;
-    this.ai.step = aiSd.step || 0;
-    var ai = aiSd.info || {};
-    this.ai.cleared = ai.total_cleared || 0;
-    if (ai.avg_delay > 0) { this.ai.totalWait += ai.avg_delay; this.ai.waitCount++; }
-    if (ai.los) this.ai.los = ai.los;
-    this.aiQHist.push((ai.ns_queue||0)+(ai.ew_queue||0));
-    if (this.aiQHist.length > 120) this.aiQHist.shift();
-  }
-
-  this.updateUI();
-  if (this.fixed.step >= this.horizon && this.ai.step >= this.horizon) this.finish();
-}
-
+    this.updateUI();
+    if (this.fixed.step >= this.horizon && this.ai.step >= this.horizon) { this.finish(); }
+  },
 
   finish() {
     if (!this.running) return; // guard against double-finish
