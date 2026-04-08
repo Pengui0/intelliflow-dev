@@ -1211,7 +1211,7 @@ function dqnActionToApiAction(dqnAction, obs) {
    SHARED STATE & HELPERS
 ═══════════════════════════════════════════════════════════════════════ */
 const BASE = window.location.origin;
-let sessionId = null, running = false, paused = false, horizon = 600, logN = 0;
+let sessionId = null, running = false, horizon = 600, logN = 0;
 let nsHist = [], ewHist = [];
 const MAX_H = 200, TREND_MAX = 200;
 let trendDelayHist = [], trendThruHist = [], trendQueueHist = [];
@@ -1316,7 +1316,6 @@ function checkCrashes() {
   for(var i=0;i<box.length;i++){for(var j=i+1;j<box.length;j++){var a=box[i],b=box[j];if(a.ln===b.ln)continue;var aIsNS=a.ln[0]==='N'||a.ln[0]==='S',bIsNS=b.ln[0]==='N'||b.ln[0]==='S';if(aIsNS===bIsNS)continue;var dx=a.x-b.x,dy=a.y-b.y;if(Math.sqrt(dx*dx+dy*dy)<CRASH_DIST){a.car.crashed=true;b.car.crashed=true;crashEvents.push({x:(a.x+b.x)/2,y:(a.y+b.y)/2,t:0});crashFlash=12;addVizCrash(1);log('Crash detected','err');}}}
 }
 function updateVehicles(dt) {
-  if (paused) return;
   LANE_NAMES.forEach(function(ln) {
     var def=LDEFS[ln]; if(!def) return; var q=LQUEUES[ln];
     var green=carIsGreen(ln), stop=def.stopPos;
@@ -2757,7 +2756,7 @@ function updateDecisionPanel(info) {
 }
 
 function updateSaturation(lanes){['N','S','E','W'].forEach(function(dir){var dl=lanes.filter(function(l){return l.name[0]===dir;});if(!dl.length)return;var sat=Math.min(dl.reduce(function(s,l){return s+l.queue;},0)/dl.reduce(function(s,l){return s+Math.max(l.capacity,1);},0),1);var pct=(sat*100).toFixed(0);var fe=document.getElementById('sat-'+dir),ve=document.getElementById('satv-'+dir);if(fe){fe.style.width=pct+'%';fe.style.background=sat>0.75?'var(--red)':sat>0.45?'var(--sand)':'var(--green)';}if(ve)ve.textContent=pct+'%';});}
-function updateSummaryCard(info){if(!info)return;var st=function(id,v){var e=document.getElementById(id);if(e)e.textContent=v;};var arrived=info.total_arrived||0,cleared=info.total_cleared||0;st('sum-total',cleared.toLocaleString());st('sum-total-sub',arrived.toLocaleString()+' arrived / '+cleared.toLocaleString()+' cleared');var delay=info.avg_delay||0;st('sum-delay',delay.toFixed(1)+'s');st('sum-delay-sub',delay<=10?'LOS A — free flow':delay<=35?'LOS B/C — acceptable':'LOS D+ — congested');st('sum-peak',Math.round(info.peak_queue||0)+' veh');st('sum-co2',(info.emission_kg_co2||0).toFixed(3)+' kg');}
+function updateSummaryCard(info){if(!info||_episodeFrozen)return;var st=function(id,v){var e=document.getElementById(id);if(e)e.textContent=v;};var arrived=info.total_arrived||0,cleared=info.total_cleared||0;st('sum-total',cleared.toLocaleString());st('sum-total-sub',arrived.toLocaleString()+' arrived / '+cleared.toLocaleString()+' cleared');var delay=info.avg_delay||0;st('sum-delay',delay.toFixed(1)+'s');st('sum-delay-sub',delay<=10?'LOS A — free flow':delay<=35?'LOS B/C — acceptable':'LOS D+ — congested');st('sum-peak',Math.round(info.peak_queue||0)+' veh');st('sum-co2',(info.emission_kg_co2||0).toFixed(3)+' kg');}
 
 function log(msg,type){type=type||'';var box=document.getElementById('log-box');var ts=new Date().toLocaleTimeString('en-GB',{hour12:false});var r=document.createElement('div');r.className='log-row';r.innerHTML='<span class="log-ts">'+ts+'</span><span class="log-msg '+type+'">'+msg+'</span>';box.insertBefore(r,box.firstChild);while(box.children.length>100)box.removeChild(box.lastChild);logN++;document.getElementById('log-count').textContent=logN+' entries';}
 function gradeLabel(s){if(s===null||s===undefined)return{stars:'☆☆☆',note:'Not evaluated yet.'};var p=Math.round(s*100);if(p>=80)return{stars:'★★★',note:'Excellent — '+p+'% efficiency'};if(p>=60)return{stars:'★★☆',note:'Good — '+p+'% efficiency'};return{stars:'★☆☆',note:'Needs work — '+p+'%'};}
@@ -2900,7 +2899,6 @@ function applySimSpeed() {
           DQN.saveModel();
         }
         await doGrade();
-        if(sd.info) updateSummaryCard(sd.info);
         _episodeFrozen = true;
         document.getElementById('status-txt').textContent='Episode complete ✓ — metrics preserved';
         log('Episode finished. Efficiency: '+effPct().toFixed(1)+'%','ok');
@@ -2910,7 +2908,7 @@ function applySimSpeed() {
 }
 
 document.getElementById('btn-reset').addEventListener('click',async function() {
-  running=false;paused=false;_episodeFrozen=false;
+  running=false;_episodeFrozen=false;
   if(runInterval){clearInterval(runInterval);runInterval=null;}LANE_NAMES.forEach(function(n){LQUEUES[n]=[];});
   _lastObs=null;_lastInfo=null;
   document.getElementById('status-txt').textContent='Initialising…';
@@ -2918,7 +2916,7 @@ document.getElementById('btn-reset').addEventListener('click',async function() {
 });
 
 document.getElementById('btn-run-rl').addEventListener('click',async function() {
-  opMode='rl';paused=false;
+  opMode='rl';
   _lastObs=null;_lastInfo=null;
   if(!sessionId)await doReset();if(runInterval){clearInterval(runInterval);runInterval=null;}
   running=true;document.getElementById('status-txt').textContent='DQN agent running — training live…';fixedTimer=0;forcedPhase=null;applySimSpeed();
@@ -2926,13 +2924,13 @@ document.getElementById('btn-run-rl').addEventListener('click',async function() 
 });
 
 document.getElementById('btn-run').addEventListener('click',async function() {
-  opMode='pressure';paused=false;_lastObs=null;_lastInfo=null;
+  opMode='pressure';_lastObs=null;_lastInfo=null;
   if(!sessionId)await doReset();if(runInterval){clearInterval(runInterval);runInterval=null;}
   running=true;document.getElementById('status-txt').textContent='Pressure policy running…';fixedTimer=0;forcedPhase=null;applySimSpeed();
 });
 
 document.getElementById('btn-stop').addEventListener('click',function() {
-  running=false;paused=true;if(runInterval){clearInterval(runInterval);runInterval=null;}
+  running=false;if(runInterval){clearInterval(runInterval);runInterval=null;}
   document.getElementById('status-txt').textContent='Stopped.';log('Policy stopped.','warn');
   if(opMode==='rl') DQN.saveModel();
 });
@@ -2992,7 +2990,7 @@ var BATTLE = {
     this._aiLastObs = null;
     this.fixedStep = 0;
     this.aiStep = 0;
-    this.interval = setInterval(() => this.tick(), 450);
+    this.interval = setInterval(() => this.tick(), 160);
   },
 
   async tick() {
@@ -3010,9 +3008,10 @@ var BATTLE = {
         fetch(BASE+'/step',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({session_id:this.fixedSessionId,action:fixedAction})})
         .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
-        .catch(e=>{if(e.message.includes('404')||e.message.includes('HTTP 4')){log('Session lost — stop & restart Battle','err');this.stop();}return null;})
-      ]);
+        .catch(e=>{log('Battle step err: '+e.message,'err');return null;})
+      );
     } else { promises.push(Promise.resolve(null)); }
+
     if (!done2) {
       // FIX 3: use this._aiLastObs (not {}) for the actual obs passed to
       // dqnActionToApiAction, and drop the stale DQN.lastQVals guard so the
@@ -3029,7 +3028,7 @@ var BATTLE = {
         fetch(BASE+'/step',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({session_id:this.aiSessionId,action:aiAction})})
         .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
-        .catch(e=>{if(e.message.includes('404')||e.message.includes('HTTP 4')){log('Session lost — stop & restart Battle','err');this.stop();}return null;})
+        .catch(e=>{log('Battle step err: '+e.message,'err');return null;})
       );
     } else { promises.push(Promise.resolve(null)); }
 
@@ -3245,11 +3244,6 @@ document.getElementById('btn-battle-stop').addEventListener('click',  () => BATT
   log('Architecture: Double DQN · Adam lr=0.0005 · γ=0.95 · Replay 2000 · Batch 32 · ε-greedy · 5 actions · full 57-dim obs', 'rl');
   log('Weights auto-save to server every 50 train steps and on episode end / stop.', 'rl');
 })();
-
-// Keep HF Space awake
-setInterval(async function() {
-  try { await fetch(BASE + '/reset', {method:'HEAD'}); } catch(e) {}
-}, 25000);
 
 function toggleFullscreen() {
   if (!document.fullscreenElement) {
