@@ -2995,7 +2995,7 @@ var BATTLE = {
 
   async tick() {
     if (!this.running) return;
-    const STEPS_PER_TICK = 10;
+    const STEPS_PER_TICK = 3;
     for (let _s = 0; _s < STEPS_PER_TICK; _s++) {
     if (!this.running) return;
     var done1 = this.fixed.step >= this.horizon;
