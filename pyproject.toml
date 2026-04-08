@@ -8,7 +8,7 @@ version = "1.0.0"
 description = "IntelliFlow Urban Traffic Control - OpenEnv RL Environment"
 requires-python = ">=3.9"
 dependencies = [
-    "openenv-core>=0.2.0",
+    "openenv>=2.0.0",
     "fastapi",
     "uvicorn",
     "openai",
