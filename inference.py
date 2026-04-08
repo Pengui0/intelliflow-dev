@@ -289,8 +289,6 @@ def run_episode(
 
     elapsed = time.time() - t_start
 
-    grade_data = client.grade(session_id)   # this line already exists below, don't duplicate
-
     # Grade
     grade_data = client.grade(session_id)
     print(f"[END] success=true steps={step_count} score={grade_data.get('score', 0.0):.3f} rewards={','.join(f'{r:.3f}' for r in rewards)}", flush=True)
