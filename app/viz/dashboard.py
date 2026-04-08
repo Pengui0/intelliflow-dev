@@ -719,9 +719,9 @@ canvas#rl-loss-canvas{display:block;width:100%;height:40px;border-radius:4px;bac
 
 /* ═══════════════════════════════════════════════════════════════════════
    DEEP Q-NETWORK (DQN) AGENT — Pure JavaScript Neural Network
-   Architecture: 16-input → Dense(128,ReLU) → Dense(128,ReLU) → Dense(64,ReLU) → Q(3 actions)
+   Architecture: 57-input → Dense(128,ReLU) → Dense(128,ReLU) → Dense(64,ReLU) → Q(5 actions)
    Training: Experience Replay + Target Network + Epsilon-Greedy Exploration
-   Actions: 0=HOLD current phase, 1=SWITCH phase, 2=EXTEND current phase (extra 10s)
+   Actions: 0=HOLD, 1=SWITCH, 2=EXTEND, 3=ALL_RED, 4=YIELD
 ═══════════════════════════════════════════════════════════════════════ */
 
 class Matrix {
@@ -769,7 +769,6 @@ class DenseLayer {
     this.inDim = inDim; this.outDim = outDim;
     this.lastIn = null; this.lastOut = null;
   }
-  // FIX 1: allocate out once, fill every element cleanly, remove duplicate lastOut assignment
   forward(x, activate) {
     this.lastIn = x.slice();
     var out = new Float32Array(this.outDim);
@@ -842,8 +841,6 @@ class QNetwork {
     x = this.l4.forward(x, false);
     return x;
   }
-  // FIX 2: accept already-computed q values — no second forward pass that would
-  // corrupt all layers' lastIn/lastOut before backward() reads them
   backward(q, target_q, action) {
     var loss = 0.5 * (q[action] - target_q) * (q[action] - target_q);
     var dOut = new Float32Array(5);
@@ -854,19 +851,17 @@ class QNetwork {
     this.l1.backward(d, true);
     return loss;
   }
-  // FIX 2: ONE forward pass whose layer state is then consumed by backward()
   accumulateGrad(state, action, target_q) {
-  var q = this.forward(state);
-  return this.backward(q, target_q, action);
-}
-applyGradients(lr) {
-  this.adamT++;
-  this.l1.adamStep(lr, this.adamT); this.l2.adamStep(lr, this.adamT);
-  this.l3.adamStep(lr, this.adamT); this.l4.adamStep(lr, this.adamT);
-  this.l1.zeroGrad(); this.l2.zeroGrad();
-  this.l3.zeroGrad(); this.l4.zeroGrad();
-}
-  
+    var q = this.forward(state);
+    return this.backward(q, target_q, action);
+  }
+  applyGradients(lr) {
+    this.adamT++;
+    this.l1.adamStep(lr, this.adamT); this.l2.adamStep(lr, this.adamT);
+    this.l3.adamStep(lr, this.adamT); this.l4.adamStep(lr, this.adamT);
+    this.l1.zeroGrad(); this.l2.zeroGrad();
+    this.l3.zeroGrad(); this.l4.zeroGrad();
+  }
   copyWeightsFrom(src) {
     function copyLayer(dst, s) {
       dst.W.copyFrom(s.W); dst.b.copyFrom(s.b);
@@ -928,7 +923,7 @@ var DQN = {
     this.lastAction = null;
     this.lastQVals = null;
     this.updateUI();
-    rlLog('DQN agent initialised — 16→128→128→64→3 network, Adam lr=' + this.LR);
+    rlLog('DQN agent initialised — 57→128→128→64→5 network, Adam lr=' + this.LR);
   },
 
   STORAGE_KEY: 'dqn-model-v1',
@@ -952,8 +947,21 @@ var DQN = {
         body:    JSON.stringify(payload)
       });
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      rlLog('Model saved to server', 'ok');
     } catch(e) {
-      console.warn('DQN save failed:', e);
+      console.warn('Server save failed, falling back to localStorage', e);
+      try {
+        localStorage.setItem(this.STORAGE_KEY, JSON.stringify({
+          epsilon:       this.EPSILON,
+          trainSteps:    this.trainSteps,
+          totalSteps:    this.totalSteps,
+          episodes:      this.episodes,
+          lossHist:      this.lossHist.slice(-120),
+          rollingReward: this.rollingReward
+          // note: weights omitted due to size
+        }));
+        rlLog('Partial state saved to localStorage (weights not saved)', 'warn');
+      } catch(le) { console.warn('localStorage save failed:', le); }
     }
   },
 
@@ -962,7 +970,7 @@ var DQN = {
       var resp = await fetch('/load_weights');
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
       var json = await resp.json();
-      if (!json.found || !json.data) return false;
+      if (!json.found || !json.data) throw new Error('not found');
       var d = json.data;
       this.online        = QNetwork.fromJSON(d.online);
       this.target        = QNetwork.fromJSON(d.target);
@@ -975,7 +983,20 @@ var DQN = {
       rlLog('Model restored from server · ε=' + this.EPSILON.toFixed(3) + ' · episodes=' + this.episodes + ' · steps=' + this.totalSteps, 'ok');
       return true;
     } catch(e) {
-      rlLog('No saved model on server — starting fresh', 'warn');
+      try {
+        var saved = localStorage.getItem(this.STORAGE_KEY);
+        if (saved) {
+          var d = JSON.parse(saved);
+          this.EPSILON       = d.epsilon || 1.0;
+          this.trainSteps    = d.trainSteps || 0;
+          this.episodes      = d.episodes || 0;
+          this.lossHist      = d.lossHist || [];
+          this.rollingReward = d.rollingReward || 0;
+          rlLog('Partial state restored from localStorage · ε=' + this.EPSILON.toFixed(3), 'warn');
+          return false; // weights not restored
+        }
+      } catch(le) {}
+      rlLog('No saved model — starting fresh', 'warn');
       return false;
     }
   },
@@ -1028,7 +1049,6 @@ var DQN = {
     else if (los === 'F') r -= 2.0;
     r -= (info.step_crashes || 0) * 8.0;
     r -= (info.spillback_count || 0) * 0.5;
-    var totalQ = (info.ns_queue || 0) + (info.ew_queue || 0);
     if (this.lastAction === 3) {
       r += (info.spillback_count || 0) > 3 ? 0.5 : -0.4;
     }
@@ -1086,45 +1106,45 @@ var DQN = {
   },
 
   trainBatch: function() {
-  var batch = [];
-  for (var i = 0; i < this.BATCH_SIZE; i++) {
-    var idx = Math.floor(Math.random() * this.replay.length);
-    batch.push(this.replay[idx]);
-  }
-
-  this.online.l1.zeroGrad(); this.online.l2.zeroGrad();
-  this.online.l3.zeroGrad(); this.online.l4.zeroGrad();
-
-  var totalLoss = 0;
-  for (var bi = 0; bi < batch.length; bi++) {
-    var tr = batch[bi];
-    var targetQ;
-    if (tr.done) {
-      targetQ = tr.r;
-    } else {
-      var nextQOnline = this.online.forward(tr.ns);
-      var bestA = 0;
-      for (var i = 1; i < 5; i++) if (nextQOnline[i] > nextQOnline[bestA]) bestA = i;
-      var nextQTarget = this.target.forward(tr.ns);
-      targetQ = tr.r + this.GAMMA * nextQTarget[bestA];
+    var batch = [];
+    for (var i = 0; i < this.BATCH_SIZE; i++) {
+      var idx = Math.floor(Math.random() * this.replay.length);
+      batch.push(this.replay[idx]);
     }
-    totalLoss += this.online.accumulateGrad(tr.s, tr.a, targetQ);
-  }
 
-  this.online.applyGradients(this.LR);
+    this.online.l1.zeroGrad(); this.online.l2.zeroGrad();
+    this.online.l3.zeroGrad(); this.online.l4.zeroGrad();
 
-  this.trainSteps++;
-  var avgLoss = totalLoss / this.BATCH_SIZE;
-  this.lossHist.push(avgLoss);
-  if (this.lossHist.length > 120) this.lossHist.shift();
+    var totalLoss = 0;
+    for (var bi = 0; bi < batch.length; bi++) {
+      var tr = batch[bi];
+      var targetQ;
+      if (tr.done) {
+        targetQ = tr.r;
+      } else {
+        var nextQOnline = this.online.forward(tr.ns);
+        var bestA = 0;
+        for (var i = 1; i < 5; i++) if (nextQOnline[i] > nextQOnline[bestA]) bestA = i;
+        var nextQTarget = this.target.forward(tr.ns);
+        targetQ = tr.r + this.GAMMA * nextQTarget[bestA];
+      }
+      totalLoss += this.online.accumulateGrad(tr.s, tr.a, targetQ);
+    }
 
-  if (this.trainSteps % this.TARGET_UPDATE_FREQ === 0) {
-    this.target.copyWeightsFrom(this.online);
-    rlLog('Target network synced (step ' + this.trainSteps + ')');
-  }
+    this.online.applyGradients(this.LR);
 
-  return avgLoss;
-},
+    this.trainSteps++;
+    var avgLoss = totalLoss / this.BATCH_SIZE;
+    this.lossHist.push(avgLoss);
+    if (this.lossHist.length > 120) this.lossHist.shift();
+
+    if (this.trainSteps % this.TARGET_UPDATE_FREQ === 0) {
+      this.target.copyWeightsFrom(this.online);
+      rlLog('Target network synced (step ' + this.trainSteps + ')');
+    }
+
+    return avgLoss;
+  },
 
   updateUI: function() {
     var st = function(id, v) { var e = document.getElementById(id); if (e) e.textContent = v; };
@@ -1156,17 +1176,18 @@ var DQN = {
 
     if (this.lastQVals) {
       var bestA = 0;
-      for (var i = 1; i < 3; i++) if (this.lastQVals[i] > this.lastQVals[bestA]) bestA = i;
+      for (var i = 1; i < 5; i++) if (this.lastQVals[i] > this.lastQVals[bestA]) bestA = i;
       var qNames = ['rl-q0','rl-q1','rl-q2','rl-q3','rl-q4'];
       qNames.forEach(function(id, i) {
         var e = document.getElementById(id); if (!e) return;
         e.textContent = DQN.lastQVals[i] !== undefined ? DQN.lastQVals[i].toFixed(3) : '—';
         e.className = 'rl-qval-num ' + (i === bestA ? 'best' : 'other');
       });
-      var avgQ = (this.lastQVals[0] + this.lastQVals[1] + this.lastQVals[2]) / 3;
+      var avgQ = (this.lastQVals[0] + this.lastQVals[1] + this.lastQVals[2] + this.lastQVals[3] + this.lastQVals[4]) / 5;
       st('dm-qval', avgQ.toFixed(3));
       st('bab-qval', avgQ.toFixed(2));
-      st('bab-rl-action', ['HOLD','SWITCH','EXTEND'][this.lastAction !== null ? this.lastAction : 0]);
+      var ACTION_NAMES = ['HOLD','SWITCH','EXTEND','ALL_RED','YIELD'];
+      st('bab-rl-action', ACTION_NAMES[this.lastAction !== null ? this.lastAction : 0]);
       st('bab-rl-loss', lastLoss);
     }
 
@@ -1179,9 +1200,6 @@ function rlLog(msg) { log(msg, 'rl'); }
 function drawRLLossChart() {
   var canvas = document.getElementById('rl-loss-canvas');
   if (!canvas) return;
-  // FIX 1: offsetWidth can be 0 if canvas is not yet visible/laid out.
-  // Fall back to the canvas's own width attribute so we never get W=0,
-  // which would cause the gradient and all tx() calls to produce NaN.
   var W = canvas.offsetWidth || canvas.width || 400;
   var dpr = window.devicePixelRatio || 1, H = 40;
   canvas.width = W * dpr; canvas.height = H * dpr;
@@ -1345,21 +1363,17 @@ function updateVehicles(dt) {
         if(car.pos<def.exitPos) car.exited=true;
       }
     }
-    // Single reverse-pass removal (your existing fix was correct)
     for(var i=q.length-1;i>=0;i--){
       if(q[i].crashed||q[i].exited) q.splice(i,1);
     }
-  });  // ← FIXED: was }; before
-
+  });
   checkCrashes();
   for(var i=crashEvents.length-1;i>=0;i--){
     crashEvents[i].t+=dt/30;
     if(crashEvents[i].t>1) crashEvents.splice(i,1);
   }
   if(crashFlash>0) crashFlash-=dt;
-}  // ← ADDED: this closing brace was missing
-
-// Now drawVehicle is correctly OUTSIDE updateVehicles
+}
 
 function drawVehicle(c,ln,car) {
   if(car.crashed||car.exited) return; var pos=carXY(ln,car); var x=pos.x,y=pos.y; var def=LDEFS[ln];
@@ -2090,10 +2104,6 @@ function buildBuildings(scene, shadowGen) {
           new BABYLON.Vector3(bc.x, bc.h + bc.h * 0.22 + 0.9, bc.z), scene);
         blinkLight.diffuse = new BABYLON.Color3(1, 0, 0);
         blinkLight.intensity = 0; blinkLight.range = 6;
-        // FIX 3: capture blinkT and blinkMat/blinkLight per-building in a closure
-        // to prevent all blink callbacks sharing the same blinkT variable
-        // (the original let all antennas blink in sync because blinkT was
-        // overwritten each iteration and all closures referenced the same binding).
         (function(bMat_, bLight_) {
           var blinkT_ = Math.random() * Math.PI * 2;
           scene.registerBeforeRender(function() {
@@ -2106,9 +2116,6 @@ function buildBuildings(scene, shadowGen) {
       }
     }
 
-    // FIX 3 continued: wCols/wRows were declared with var inside configs.forEach,
-    // so they leaked across iterations (var hoisting). Renamed to wC/wR to be
-    // explicit that each building gets its own loop variables.
     if (bc.style === 'glass') {
       var wC = Math.max(3, Math.floor(bc.w / 1.6));
       var wR = Math.max(4, Math.floor(bc.h / 2.0));
@@ -2271,13 +2278,6 @@ function buildTrafficLights(scene,shadowGen) {
     tlGlow.diffuse=new BABYLON.Color3(0.2,1.0,0.4);
     tlGlow.intensity=0;tlGlow.range=8;
 
-    // FIX 4: _babTLMeshes was being assigned inside the forEach loop but the
-    // direction key used tp.dir correctly — however redMat/greenMat/amberMat
-    // were declared with var so they were function-scoped and the last
-    // iteration's values would bleed into closure captures.  Wrapping the
-    // assignment in the loop body (already closure-safe via forEach) is fine,
-    // but we must ensure we assign after all materials are created for this
-    // direction, which the original already did.  No change needed there.
     _babTLMeshes[tp.dir]={redMat:redMat,greenMat:greenMat,amberMat:amberMat,glow:tlGlow};
   });
 }
@@ -2469,9 +2469,6 @@ function buildClouds(scene) {
       cloud.material = cm;
       cloud.infiniteDistance = false;
 
-      // FIX 1: wrap in IIFE so each cloud sphere gets its own closed-over
-      // cloud reference, driftSpeed, and origX — prevents all 4 spheres in
-      // a cloud from sharing the last iteration's values.
       (function(c_, speed_, ox_) {
         scene.registerBeforeRender(function() {
           c_.position.x += speed_;
@@ -2483,7 +2480,6 @@ function buildClouds(scene) {
 }
 
 function buildCarMeshPool(scene,shadowGen) {
-  /* Build 48 cars — 4 per lane × 12 lanes — each with a FIXED stable colour */
   _babCarMeshes=[];
   LANE_NAMES.forEach(function(ln,li){
     for(var ci=0;ci<4;ci++){
@@ -2743,7 +2739,7 @@ function updateDecisionPanel(info) {
   var isNS=phase==='NS_GREEN'||phase==='NS_MINOR',isEW=phase==='EW_GREEN',isRed=phase==='ALL_RED';
   var reasons=[];
   if(opMode==='rl'&&DQN.lastQVals){
-    var actionNames=['HOLD','SWITCH','EXTEND'];var bestA=0;for(var i=1;i<3;i++)if(DQN.lastQVals[i]>DQN.lastQVals[bestA])bestA=i;
+    var actionNames=['HOLD','SWITCH','EXTEND','ALL_RED','YIELD'];var bestA=0;for(var i=1;i<5;i++)if(DQN.lastQVals[i]>DQN.lastQVals[bestA])bestA=i;
     reasons.push({dot:'purple',text:'DQN chose: '+actionNames[bestA]+' (Q='+DQN.lastQVals[bestA].toFixed(2)+')'});
     reasons.push({dot:'purple',text:'ε='+DQN.EPSILON.toFixed(3)+' · replay='+DQN.replay.length+' · steps='+DQN.totalSteps});
   }
@@ -2950,6 +2946,7 @@ var BATTLE = {
   fixedQHist: [],
   aiQHist:    [],
   interval:   null,
+  _errCount: 0,       // consecutive error counter
 
   fixed: { cleared: 0, totalWait: 0, waitCount: 0, los: '—', step: 0 },
   ai:    { cleared: 0, totalWait: 0, waitCount: 0, los: '—', step: 0 },
@@ -2964,6 +2961,7 @@ var BATTLE = {
     this.fixedTimer = 0;
     this.fixed = { cleared: 0, totalWait: 0, waitCount: 0, los: '—', step: 0 };
     this.ai    = { cleared: 0, totalWait: 0, waitCount: 0, los: '—', step: 0 };
+    this._errCount = 0;
     this.resetUI();
 
     try {
@@ -2999,6 +2997,9 @@ var BATTLE = {
     var done2 = this.ai.step    >= this.horizon;
     if (done1 && done2) { this.finish(); return; }
 
+    // Track consecutive errors
+    this._errCount = this._errCount || 0;
+
     var promises = [];
 
     if (!done1) {
@@ -3013,9 +3014,6 @@ var BATTLE = {
     } else { promises.push(Promise.resolve(null)); }
 
     if (!done2) {
-      // FIX 3: use this._aiLastObs (not {}) for the actual obs passed to
-      // dqnActionToApiAction, and drop the stale DQN.lastQVals guard so the
-      // AI always picks an action even before the main episode has run.
       var aiAction = 0;
       if (DQN.online) {
         var tmpState = DQN.extractState(this._aiLastObs || null);
@@ -3033,6 +3031,17 @@ var BATTLE = {
     } else { promises.push(Promise.resolve(null)); }
 
     var [fixedSd, aiSd] = await Promise.all(promises);
+
+    // If both returned null (errors), increment error count and stop if too many
+    if (!fixedSd && !aiSd) {
+      this._errCount++;
+      if (this._errCount > 5) {
+        log('Battle aborted — too many consecutive errors', 'err');
+        this.stop(); return;
+      }
+    } else {
+      this._errCount = 0;
+    }
 
     if (fixedSd) {
       this.fixed.step = fixedSd.step || 0;
@@ -3060,16 +3069,16 @@ var BATTLE = {
   },
 
   finish() {
+    if (!this.running) return; // guard against double-finish
     this.running = false;
     clearInterval(this.interval); this.interval = null;
+    this._errCount = 0;
     document.getElementById('fixed-dot').classList.remove('active');
     document.getElementById('ai-dot').classList.remove('active');
     document.getElementById('btn-battle-start').style.display = 'flex';
     document.getElementById('btn-battle-stop').style.display  = 'none';
     document.getElementById('vs-step-badge').textContent = 'DONE';
 
-    // FIX 4: replaced the meaningless cleared/(cleared+1) formula with a
-    // proper efficiency percentage relative to episode horizon throughput.
     var aiEff   = Math.min(100, this.ai.cleared    / Math.max(this.horizon * 0.5, 1) * 100);
     var fixEff  = Math.min(100, this.fixed.cleared / Math.max(this.horizon * 0.5, 1) * 100);
     var aiWait  = this.ai.waitCount    > 0 ? this.ai.totalWait    / this.ai.waitCount    : 0;
@@ -3275,8 +3284,3 @@ document.addEventListener('fullscreenchange', function() {
 </script>
 </body>
 </html>"""
-
-DASHBOARD_HTML = __doc__
-
-def render_dashboard():
-    return DASHBOARD_HTML
