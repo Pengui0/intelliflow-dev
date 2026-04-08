@@ -431,7 +431,7 @@ canvas#rl-loss-canvas{display:block;width:100%;height:40px;border-radius:4px;bac
   </div>
   <div class="rl-metrics">
     <div class="rl-metric"><div class="rl-metric-lbl">Episodes Trained</div><div class="rl-metric-val" id="rl-episodes">0</div></div>
-    <div class="rl-metric"><div class="rl-metric-lbl">Replay Buffer</div><div class="rl-metric-val" id="rl-buffer">0 / 2000</div></div>
+    <div class="rl-metric"><div class="rl-metric-lbl">Replay Buffer</div><div class="rl-metric-val" id="rl-buffer">0 / 10000</div></div>
     <div class="rl-metric"><div class="rl-metric-lbl">ε Epsilon</div><div class="rl-metric-val" id="rl-epsilon">1.000</div></div>
     <div class="rl-metric"><div class="rl-metric-lbl">Avg Loss</div><div class="rl-metric-val" id="rl-loss-val">—</div></div>
   </div>
@@ -893,7 +893,7 @@ var DQN = {
   online: null,
   target: null,
   replay: [],
-  BUFFER_MAX: 2000,
+  BUFFER_MAX: 10000,
   BATCH_SIZE: 32,
   GAMMA: 0.95,
   LR: 0.0005,
@@ -2792,7 +2792,6 @@ async function doGrade() {
 
 async function updateUI(sd) {
   if(!sd)return;var step=sd.step||0,info=sd.info||{},phase=info.phase||'NS_GREEN';
-  if(_episodeFrozen)return;
   document.getElementById('kpi-step').textContent=step;document.getElementById('prog-step').textContent=step;
   document.getElementById('prog-fill').style.width=(horizon>0?(step/horizon*100).toFixed(1):0)+'%';
   var phCls='phase-tag ph-'+phase;
@@ -2898,8 +2897,8 @@ function applySimSpeed() {
           rlLog('Episode done. Replay:'+DQN.replay.length+' ε:'+DQN.EPSILON.toFixed(3)+' steps:'+DQN.totalSteps);
           DQN.saveModel();
         }
-        await doGrade();
         _episodeFrozen = true;
+        await doGrade();
         document.getElementById('status-txt').textContent='Episode complete ✓ — metrics preserved';
         log('Episode finished. Efficiency: '+effPct().toFixed(1)+'%','ok');
       }
@@ -2990,7 +2989,8 @@ var BATTLE = {
     this._aiLastObs = null;
     this.fixedStep = 0;
     this.aiStep = 0;
-    this.interval = setInterval(() => this.tick(), 160);
+    this.running = true;
+    setTimeout(() => this.tick(), 0);
   },
 
   async tick() {
@@ -3056,12 +3056,16 @@ var BATTLE = {
     }
 
     this.updateUI();
-    if (this.fixed.step >= this.horizon && this.ai.step >= this.horizon) { this.finish(); }
+    if (this.fixed.step >= this.horizon && this.ai.step >= this.horizon) { 
+      this.finish(); 
+    } else if (this.running) {
+      setTimeout(() => this.tick(), 0);
+    }
   },
 
   finish() {
     this.running = false;
-    clearInterval(this.interval); this.interval = null;
+    this.interval = null;
     document.getElementById('fixed-dot').classList.remove('active');
     document.getElementById('ai-dot').classList.remove('active');
     document.getElementById('btn-battle-start').style.display = 'flex';
@@ -3109,7 +3113,7 @@ var BATTLE = {
 
   stop() {
     this.running = false;
-    clearInterval(this.interval); this.interval = null;
+    this.interval = null;
     document.getElementById('fixed-dot').classList.remove('active');
     document.getElementById('ai-dot').classList.remove('active');
     document.getElementById('btn-battle-start').style.display = 'flex';
@@ -3234,9 +3238,19 @@ document.getElementById('btn-battle-stop').addEventListener('click',  () => BATT
   DQN.target = new QNetwork();
   DQN.target.copyWeightsFrom(DQN.online);
   var restored = await DQN.loadModel();
-  if (!restored) {
-    DQN.init();
+  if (restored) {
+    DQN.updateUI();
   } else {
+    DQN.replay = [];
+    DQN.EPSILON = 1.0;
+    DQN.trainSteps = 0;
+    DQN.totalSteps = 0;
+    DQN.episodes = 0;
+    DQN.lossHist = [];
+    DQN.rollingReward = 0;
+    DQN.lastState = null;
+    DQN.lastAction = null;
+    DQN.lastQVals = null;
     DQN.updateUI();
   }
   initVolBars();drawSparkline();drawAllTrendCharts();

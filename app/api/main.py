@@ -21,6 +21,8 @@ from app.core.session import store
 from app.tasks.registry import TASK_REGISTRY, get_task_spec_dict
 
 WEIGHTS_FILE = os.path.join(os.path.dirname(__file__), "dqn_weights.json")
+HF_TOKEN = os.environ.get("HF_TOKEN")
+HF_REPO_ID = os.environ.get("HF_REPO_ID", "your-username/your-repo-name")
 
 
 # ---------------------------------------------------------------------------
@@ -38,9 +40,6 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
-
-WEIGHTS_FILE = os.path.join(os.path.dirname(__file__), "dqn_weights.json")
-
 
 
 app.add_middleware(
@@ -434,11 +433,23 @@ async def list_sessions():
 
 @app.post("/save_weights", tags=["Admin"])
 async def save_weights(request: Request):
-    """Save DQN weights to disk — called automatically by the dashboard JS."""
+    """Save DQN weights to disk and HuggingFace Hub."""
     try:
         data = await request.json()
         with open(WEIGHTS_FILE, "w") as f:
             json.dump(data, f)
+        # Also push to HF Hub so it survives restarts
+        if HF_TOKEN:
+            try:
+                from huggingface_hub import upload_file
+                upload_file(
+                    path_or_fileobj=WEIGHTS_FILE,
+                    path_in_repo="dqn_weights.json",
+                    repo_id=HF_REPO_ID,
+                    token=HF_TOKEN,
+                )
+            except Exception as hf_err:
+                print(f"HF upload warning: {hf_err}")
         return JSONResponse({"ok": True})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
@@ -446,12 +457,30 @@ async def save_weights(request: Request):
 
 @app.get("/load_weights", tags=["Admin"])
 async def load_weights():
-    """Load DQN weights from disk — called on dashboard startup."""
+    """Load DQN weights — tries disk first, then HuggingFace Hub."""
     try:
-        if not os.path.exists(WEIGHTS_FILE):
-            return JSONResponse({"found": False})
-        with open(WEIGHTS_FILE, "r") as f:
-            data = json.load(f)
-        return JSONResponse({"found": True, "data": data})
+        # Try disk first (fast path)
+        if os.path.exists(WEIGHTS_FILE):
+            with open(WEIGHTS_FILE, "r") as f:
+                data = json.load(f)
+            return JSONResponse({"found": True, "data": data})
+        # Fall back to HF Hub (cold start after sleep)
+        if HF_TOKEN:
+            try:
+                from huggingface_hub import hf_hub_download
+                path = hf_hub_download(
+                    repo_id=HF_REPO_ID,
+                    filename="dqn_weights.json",
+                    token=HF_TOKEN,
+                )
+                with open(path, "r") as f:
+                    data = json.load(f)
+                # Cache to disk for this session
+                with open(WEIGHTS_FILE, "w") as f2:
+                    json.dump(data, f2)
+                return JSONResponse({"found": True, "data": data})
+            except Exception as hf_err:
+                print(f"HF load warning: {hf_err}")
+        return JSONResponse({"found": False})
     except Exception as e:
         return JSONResponse({"found": False, "error": str(e)}, status_code=500)
