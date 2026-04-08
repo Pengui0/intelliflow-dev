@@ -3071,7 +3071,7 @@ var BATTLE = {
 
   this.updateUI();
   if (this.fixed.step >= this.horizon && this.ai.step >= this.horizon) { this.finish(); }
-}
+};
 
 
   finish() {
