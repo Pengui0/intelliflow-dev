@@ -2988,7 +2988,7 @@ var BATTLE = {
     this._aiLastObs = null;
     this.fixedStep = 0;
     this.aiStep = 0;
-    this.interval = setInterval(() => this.tick(), 160);
+    this.interval = setInterval(() => this.tick(), 400);
   },
 
   async tick() {
@@ -2999,74 +2999,80 @@ var BATTLE = {
 
     // Track consecutive errors
     this._errCount = this._errCount || 0;
-
-    var promises = [];
-
-    if (!done1) {
-      this.fixedTimer++;
-      var fixedAction = Math.floor(this.fixedTimer / this.FIXED_CYCLE) % 2 === 0 ? 0 : 1;
-      promises.push(
-        fetch(BASE+'/step',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({session_id:this.fixedSessionId,action:fixedAction})})
-        .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
-        .catch(e=>{log('Battle step err: '+e.message,'err');return null;})
-      );
-    } else { promises.push(Promise.resolve(null)); }
-
-    if (!done2) {
-      var aiAction = 0;
-      if (DQN.online) {
-        var tmpState = DQN.extractState(this._aiLastObs || null);
-        var qv = DQN.online.forward(tmpState);
-        var rawA = 0;
-        for(var i=1;i<5;i++) if(qv[i]>qv[rawA]) rawA=i;
-        aiAction = rawA;
+    
+    const stepWithRetry = async (sessionId, action, retry = true) => {
+    try {
+      const res = await fetch(BASE + '/step', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId, action: action })
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return await res.json();
+    } catch (e) {
+      if (retry) {
+        await new Promise(r => setTimeout(r, 50));
+        return stepWithRetry(sessionId, action, false);
       }
-      promises.push(
-        fetch(BASE+'/step',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({session_id:this.aiSessionId,action:aiAction})})
-        .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
-        .catch(e=>{log('Battle step err: '+e.message,'err');return null;})
-      );
-    } else { promises.push(Promise.resolve(null)); }
-
-    var [fixedSd, aiSd] = await Promise.all(promises);
-
-    // If both returned null (errors), increment error count and stop if too many
-    if (!fixedSd && !aiSd) {
-      this._errCount++;
-      if (this._errCount > 5) {
-        log('Battle aborted — too many consecutive errors', 'err');
-        this.stop(); return;
-      }
-    } else {
-      this._errCount = 0;
+      log('Battle step err: ' + e.message, 'err');
+      return null;
     }
+  };
 
-    if (fixedSd) {
-      this.fixed.step = fixedSd.step || 0;
-      var fi = fixedSd.info || {};
-      this.fixed.cleared = fi.total_cleared || 0;
-      if (fi.avg_delay > 0) { this.fixed.totalWait += fi.avg_delay; this.fixed.waitCount++; }
-      if (fi.los) this.fixed.los = fi.los;
-      this.fixedQHist.push((fi.ns_queue||0)+(fi.ew_queue||0));
-      if (this.fixedQHist.length > 120) this.fixedQHist.shift();
+  let fixedSd = null, aiSd = null;
+  if (!done1) {
+    this.fixedTimer++;
+    var fixedAction = Math.floor(this.fixedTimer / this.FIXED_CYCLE) % 2 === 0 ? 0 : 1;
+    fixedSd = await stepWithRetry(this.fixedSessionId, fixedAction, true);
+  }
+
+  if (!done2 && fixedSd !== null) {
+    var aiAction = 0;
+    if (DQN.online) {
+      var tmpState = DQN.extractState(this._aiLastObs || null);
+      var qv = DQN.online.forward(tmpState);
+      var rawA = 0;
+      for (var i = 1; i < 5; i++) if (qv[i] > qv[rawA]) rawA = i;
+      aiAction = rawA;
     }
+    aiSd = await stepWithRetry(this.aiSessionId, aiAction, true);
+  }
 
-    if (aiSd) {
-      this._aiLastObs = aiSd.observation;
-      this.ai.step = aiSd.step || 0;
-      var ai = aiSd.info || {};
-      this.ai.cleared = ai.total_cleared || 0;
-      if (ai.avg_delay > 0) { this.ai.totalWait += ai.avg_delay; this.ai.waitCount++; }
-      if (ai.los) this.ai.los = ai.los;
-      this.aiQHist.push((ai.ns_queue||0)+(ai.ew_queue||0));
-      if (this.aiQHist.length > 120) this.aiQHist.shift();
+  if (!fixedSd && !aiSd) {
+    this._errCount++;
+    if (this._errCount > 5) {
+      log('Battle aborted — too many consecutive errors', 'err');
+      this.stop(); return;
     }
+  } else {
+    this._errCount = 0;
+  }
 
-    this.updateUI();
-    if (this.fixed.step >= this.horizon && this.ai.step >= this.horizon) { this.finish(); }
-  },
+  if (fixedSd) {
+    this.fixed.step = fixedSd.step || 0;
+    var fi = fixedSd.info || {};
+    this.fixed.cleared = fi.total_cleared || 0;
+    if (fi.avg_delay > 0) { this.fixed.totalWait += fi.avg_delay; this.fixed.waitCount++; }
+    if (fi.los) this.fixed.los = fi.los;
+    this.fixedQHist.push((fi.ns_queue || 0) + (fi.ew_queue || 0));
+    if (this.fixedQHist.length > 120) this.fixedQHist.shift();
+  }
+
+  if (aiSd) {
+    this._aiLastObs = aiSd.observation;
+    this.ai.step = aiSd.step || 0;
+    var ai = aiSd.info || {};
+    this.ai.cleared = ai.total_cleared || 0;
+    if (ai.avg_delay > 0) { this.ai.totalWait += ai.avg_delay; this.ai.waitCount++; }
+    if (ai.los) this.ai.los = ai.los;
+    this.aiQHist.push((ai.ns_queue || 0) + (ai.ew_queue || 0));
+    if (this.aiQHist.length > 120) this.aiQHist.shift();
+  }
+
+  this.updateUI();
+  if (this.fixed.step >= this.horizon && this.ai.step >= this.horizon) { this.finish(); }
+}
+
 
   finish() {
     if (!this.running) return; // guard against double-finish
