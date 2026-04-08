@@ -2995,6 +2995,9 @@ var BATTLE = {
 
   async tick() {
     if (!this.running) return;
+    const STEPS_PER_TICK = 10;
+    for (let _s = 0; _s < STEPS_PER_TICK; _s++) {
+    if (!this.running) return;
     var done1 = this.fixed.step >= this.horizon;
     var done2 = this.ai.step    >= this.horizon;
     if (done1 && done2) { this.finish(); return; }
@@ -3059,8 +3062,11 @@ var BATTLE = {
     if (this.fixed.step >= this.horizon && this.ai.step >= this.horizon) { 
       this.finish(); 
     } else if (this.running) {
-      setTimeout(() => this.tick(), 0);
+      if (_s === STEPS_PER_TICK - 1) setTimeout(() => this.tick(), 0);
     }
+    this.updateUI();
+    } // end for loop
+    if (this.running) setTimeout(() => this.tick(), 0);
   },
 
   finish() {
