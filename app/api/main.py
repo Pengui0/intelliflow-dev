@@ -157,7 +157,9 @@ async def health():
 # ---------------------------------------------------------------------------
 
 @app.post("/reset", tags=["OpenEnv"])
-async def reset(req: ResetRequest):
+async def reset(req: ResetRequest = None):
+    if req is None:
+        req = ResetRequest()
     """
     Initialize a new episode session.
     Returns session_id, initial observation, and task metadata.
