@@ -3279,4 +3279,4 @@ document.addEventListener('fullscreenchange', function() {
 DASHBOARD_HTML = __doc__
 
 def render_dashboard():
-    return DASHBOARD_HTML"""
+    return DASHBOARD_HTML
