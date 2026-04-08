@@ -983,23 +983,7 @@ var DQN = {
   maybeSave: function() {
     if (this.trainSteps > 0 && this.trainSteps % 50 === 0) {
       this.saveModel();
-      this.saveLocal();
     }
-  },
-
-  saveLocal: function() {
-    try {
-      var payload = {
-        online: this.online.toJSON(),
-        target: this.target.toJSON(),
-        epsilon: this.EPSILON,
-        trainSteps: this.trainSteps,
-        episodes: this.episodes,
-        rollingReward: this.rollingReward,
-        lossHist: this.lossHist.slice(-120)
-      };
-      localStorage.setItem('dqn-weights-v1', JSON.stringify(payload));
-    } catch(e) { console.warn('localStorage save failed:', e); }
   },
 
   extractState: function(obs) {
@@ -2914,7 +2898,6 @@ function applySimSpeed() {
           DQN.updateUI();
           rlLog('Episode done. Replay:'+DQN.replay.length+' ε:'+DQN.EPSILON.toFixed(3)+' steps:'+DQN.totalSteps);
           DQN.saveModel();
-          DQN.saveLocal();
         }
         await doGrade();
         if(sd.info) updateSummaryCard(sd.info);
@@ -2951,7 +2934,7 @@ document.getElementById('btn-run').addEventListener('click',async function() {
 document.getElementById('btn-stop').addEventListener('click',function() {
   running=false;paused=true;if(runInterval){clearInterval(runInterval);runInterval=null;}
   document.getElementById('status-txt').textContent='Stopped.';log('Policy stopped.','warn');
-  if(opMode==='rl') { DQN.saveModel(); DQN.saveLocal(); }
+  if(opMode==='rl') DQN.saveModel();
 });
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -3009,7 +2992,7 @@ var BATTLE = {
     this._aiLastObs = null;
     this.fixedStep = 0;
     this.aiStep = 0;
-    this.interval = setInterval(() => this.tick(), 160);
+    this.interval = setInterval(() => this.tick(), 450);
   },
 
   async tick() {
@@ -3027,10 +3010,9 @@ var BATTLE = {
         fetch(BASE+'/step',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({session_id:this.fixedSessionId,action:fixedAction})})
         .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
-        .catch(e=>{log('Battle step err: '+e.message,'err');return null;})
-      );
+        .catch(e=>{if(e.message.includes('404')||e.message.includes('HTTP 4')){log('Session lost — stop & restart Battle','err');this.stop();}return null;})
+      ]);
     } else { promises.push(Promise.resolve(null)); }
-
     if (!done2) {
       // FIX 3: use this._aiLastObs (not {}) for the actual obs passed to
       // dqnActionToApiAction, and drop the stale DQN.lastQVals guard so the
@@ -3047,7 +3029,7 @@ var BATTLE = {
         fetch(BASE+'/step',{method:'POST',headers:{'Content-Type':'application/json'},
         body:JSON.stringify({session_id:this.aiSessionId,action:aiAction})})
         .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
-        .catch(e=>{log('Battle step err: '+e.message,'err');return null;})
+        .catch(e=>{if(e.message.includes('404')||e.message.includes('HTTP 4')){log('Session lost — stop & restart Battle','err');this.stop();}return null;})
       );
     } else { promises.push(Promise.resolve(null)); }
 
@@ -3254,26 +3236,7 @@ document.getElementById('btn-battle-stop').addEventListener('click',  () => BATT
   DQN.target.copyWeightsFrom(DQN.online);
   var restored = await DQN.loadModel();
   if (!restored) {
-    var localWeights = localStorage.getItem('dqn-weights-v1');
-    if (localWeights) {
-      try {
-        var parsed = JSON.parse(localWeights);
-        DQN.online = QNetwork.fromJSON(parsed.online);
-        DQN.target = QNetwork.fromJSON(parsed.target);
-        DQN.EPSILON = parsed.epsilon || 1.0;
-        DQN.trainSteps = parsed.trainSteps || 0;
-        DQN.episodes = parsed.episodes || 0;
-        DQN.rollingReward = parsed.rollingReward || 0;
-        DQN.lossHist = parsed.lossHist || [];
-        DQN.updateUI();
-        rlLog('Weights restored from browser localStorage', 'ok');
-        restored = true;
-      } catch(e) {
-        DQN.init();
-      }
-    } else {
-      DQN.init();
-    }
+    DQN.init();
   } else {
     DQN.updateUI();
   }
@@ -3282,6 +3245,11 @@ document.getElementById('btn-battle-stop').addEventListener('click',  () => BATT
   log('Architecture: Double DQN · Adam lr=0.0005 · γ=0.95 · Replay 2000 · Batch 32 · ε-greedy · 5 actions · full 57-dim obs', 'rl');
   log('Weights auto-save to server every 50 train steps and on episode end / stop.', 'rl');
 })();
+
+// Keep HF Space awake
+setInterval(async function() {
+  try { await fetch(BASE + '/reset', {method:'HEAD'}); } catch(e) {}
+}, 25000);
 
 function toggleFullscreen() {
   if (!document.fullscreenElement) {
