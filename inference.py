@@ -141,8 +141,8 @@ class LLMPolicy:
         try:
             import openai
             self._client = openai.OpenAI(
-                api_key=API_KEY,
-                base_url=API_BASE_URL,
+                api_key=os.environ["API_KEY"],
+                base_url=os.environ["API_BASE_URL"],
             )
             self._available = True
         except ImportError:
@@ -150,7 +150,7 @@ class LLMPolicy:
             self._available = False
 
     def act(self, obs: Dict) -> int:
-        if not self._available or not API_KEY:
+        if not self._available or not os.environ.get("API_KEY"):
             return self._fallback.act(obs)
 
         try:
