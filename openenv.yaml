@@ -1,16 +1,19 @@
 # openenv.yaml
 # IntelliFlow Urban Traffic Control Environment
-# OpenEnv Specification Metadata v1.0
+# OpenEnv Specification Metadata v1.2.0
 # ─────────────────────────────────────────────
 
 name: IntelliFlow Urban Traffic Control
-version: "1.0.0"
+version: "1.2.0"
 description: >
   A production-grade reinforcement learning simulation environment modelling
-  a realistic urban intersection as a controllable episodic decision system.
+  a realistic urban intersection (single-node) and a 3×3 multi-intersection
+  grid (MARL) as controllable episodic decision systems.
   An intelligent agent dynamically optimises traffic signal phases to minimise
   congestion, waiting time, lane starvation, and emission proxies while
   maximising vehicle throughput and systemic efficiency.
+  New in v1.1: MARL grid tasks, emergency vehicle preemption, weather-aware
+  simulation, CO₂/economic impact tracking, and LLM meta-controller.
 
 authors:
   - IntelliFlow Research Team
@@ -21,10 +24,11 @@ tags:
   - reinforcement-learning
   - urban-simulation
   - multi-objective
+  - multi-agent
   - openenv
 
 # ─────────────────────────────────────────────
-# Observation Space
+# Observation Space — Single-Node Tasks
 # ─────────────────────────────────────────────
 observation_space:
   type: Box
@@ -35,7 +39,8 @@ observation_space:
     high: 1.0
   description: >
     57-dimensional continuous observation vector encoding the full intersection
-    state at each simulation step.
+    state at each simulation step (single-node tasks only).
+    MARL grid tasks use a 73-dimensional extended vector — see marl_observation_space.
   components:
     - name: queue_lengths
       indices: [0, 11]      # inclusive range
@@ -108,6 +113,46 @@ observation_space:
         1 = queue ≥ 85% of capacity (spillback imminent).
 
 # ─────────────────────────────────────────────
+# Observation Space — MARL Grid Tasks
+# ─────────────────────────────────────────────
+marl_observation_space:
+  type: Box
+  dtype: float32
+  shape: [73]
+  obs_dim: 73
+  bounds:
+    low: -1.0
+    high: 1.0
+  description: >
+    73-dimensional extended observation vector per agent in MARL grid tasks.
+    Appended to the standard 57-dim base observation.
+  components:
+    - name: base_observation
+      indices: [0, 56]
+      dim: 57
+      description: >
+        Standard single-node observation (see observation_space above).
+
+    - name: lstm_predictions
+      indices: [57, 68]
+      dim: 12
+      description: >
+        12-dim predicted inflow vector for the next step from the per-node
+        LSTMPredictor trained on historical arrival data. All zeros if
+        lstm_weights.json is absent or training has not yet occurred.
+
+    - name: neighbor_queue_pressures
+      indices: [69, 72]
+      dim: 4
+      description: >
+        Normalised total queue pressure (NS + EW combined) from up to 4
+        adjacent nodes in the 3×3 grid. Zero-padded for corner/edge nodes
+        with fewer than 4 neighbors.
+        Grid adjacency (row-major): node 0 = top-left, node 8 = bottom-right.
+        Neighbors: 0↔[1,3], 1↔[0,2,4], 2↔[1,5], 3↔[0,4,6],
+                   4↔[1,3,5,7], 5↔[2,4,8], 6↔[3,7], 7↔[4,6,8], 8↔[5,7].
+
+# ─────────────────────────────────────────────
 # Action Space
 # ─────────────────────────────────────────────
 action_space:
@@ -142,6 +187,10 @@ reward:
   type: dense
   frequency: every_step
   range: "approximately [-1.5, +1.5] per step under normal conditions"
+  marl_note: >
+    In MARL grid tasks each agent receives its own per-node reward plus a
+    shared coordination bonus: -0.15 * total_network_spillback_count.
+    This incentivises agents to cooperate and reduce cascade spillback.
   design_principles:
     - "Positive baseline: near zero on neutral steps, clearly positive when doing well"
     - "Delta-based queue signal: rewards queue REDUCTION, not just penalising absolute size"
@@ -153,64 +202,63 @@ reward:
     throughput_bonus:
       formula: "w_throughput * (vehicles_cleared / max_possible_clearance_this_step)"
       range: "[0, ~+1.2]"
-      description: >
-        Normalised throughput. max_possible = sat_flow * active_green_lanes.
-        Reward is in [0,1] regardless of how many lanes are green.
     queue_delta_reward:
       formula: "w_wait * clip((prev_queue - curr_queue) / (n_lanes * capacity), -1, 1)"
       range: "[-0.8, +0.8]"
-      description: >
-        Rewards actively draining queues, penalises growing them. Delta-based
-        so agent gets positive signal for every vehicle it clears beyond arrivals.
     congestion_pressure:
       formula: "-0.3 * (occupancy_rate ** 2)"
       range: "[-0.3, 0]"
-      description: Quadratic background penalty for sustained high occupancy only.
     starvation_penalty:
       formula: "w_fairness * max_deviation(main_through_lane_occupancies)"
       range: "[-0.5, 0]"
-      description: >
-        Max-deviation of the 4 main through-lanes from their mean occupancy.
-        Much more sensitive than variance for catching a single starved approach.
-        Only activates when queue occupancy exceeds 40%.
     switch_penalty:
       formula: "w_switch * [1.0 if premature+unjustified | 0.3 if premature+justified | 0 otherwise]"
       range: "[-0.25, 0]"
-      description: >
-        Context-aware. Premature = < 15 steps elapsed. Justified = pressure diff > 0.25.
-        FORCE_ALL_RED is never penalised — it's a legitimate safety action.
     spillback_severity:
       formula: "w_spillback * mean(max(0, (occ - 0.85)/0.15) for each lane)"
       range: "[-0.85, 0]"
-      description: Escalating penalty per lane based on depth into spillback zone.
     gridlock_cliff:
       formula: "-8.0 * fraction_of_gridlocked_lanes"
       range: "[-8.0, 0]"
-      description: Scaled cliff — proportional to how many lanes are simultaneously jammed.
     proactive_bonus:
       formula: "0.2 * pressure_diff if (switched AND pressure_diff > 0.3)"
       range: "[0, +0.2]"
-      description: Bonus for switching phase when incoming approach has much higher pressure.
+    coordination_bonus_marl_only:
+      formula: "-0.15 * total_network_spillback_count"
+      range: "[-1.35, 0]"
+      description: >
+        Applied to every agent's reward in MARL grid tasks. Promotes
+        network-wide cooperation to suppress cascade spillback.
 
 # ─────────────────────────────────────────────
 # Tasks
 # ─────────────────────────────────────────────
 tasks:
+  # --- Single-node tasks ---
   - id: task_suburban_steady
     name: Suburban Steady Flow
     difficulty: easy
     horizon: 600
+    obs_dim: 57
+    grid_mode: false
     description: >
       Low, symmetric, near-deterministic arrivals. Optimal policy is
       fair green time allocation. Good baseline for verifying signal logic.
     grader: weighted_composite
     score_range: [0.0, 1.0]
     expected_baseline_score: 0.55
+    baseline_policy: pressure
+    baseline_seed: 42
+    score_note: >
+      Measured via /benchmark endpoint, pressure policy, seed 42.
+      LLM agent (gpt-4o-mini) achieves 0.61-0.67 on this task.
 
   - id: task_urban_stochastic
     name: Urban Stochastic Rush
     difficulty: medium
     horizon: 1200
+    obs_dim: 57
+    grid_mode: false
     description: >
       Bursty, asymmetric inflows with stochastic lambda perturbation.
       Requires adaptive timing and predictive reasoning.
@@ -222,6 +270,8 @@ tasks:
     name: Rush Hour Crisis
     difficulty: hard
     horizon: 1800
+    obs_dim: 57
+    grid_mode: false
     description: >
       Maximum load scenario: rain, blocked lane, near-saturation arrivals,
       congestion cascade risk. Agent must survive gridlock and maintain
@@ -230,6 +280,54 @@ tasks:
     score_range: [0.0, 1.0]
     expected_baseline_score: 0.30
 
+  # --- MARL 3x3 grid tasks ---
+  - id: task_grid_steady
+    name: "Grid: Suburban Steady Flow (3x3)"
+    difficulty: medium
+    horizon: 600
+    obs_dim: 73
+    grid_mode: true
+    n_agents: 9
+    description: >
+      Nine suburban intersections in a 3x3 grid under steady symmetric flow.
+      Agents must coordinate to prevent cascade spillback. Per-node dynamics
+      mirror task_suburban_steady. Observation extended with LSTM predictions
+      and neighbor queue pressures. Score = mean across 9 nodes.
+    grader: weighted_composite_mean_9
+    score_range: [0.0, 1.0]
+    expected_baseline_score: 0.50
+
+  - id: task_grid_rush
+    name: "Grid: Urban Stochastic Rush (3x3)"
+    difficulty: hard
+    horizon: 1200
+    obs_dim: 73
+    grid_mode: true
+    n_agents: 9
+    description: >
+      Nine urban intersections under stochastic asymmetric rush-hour flow.
+      Agents must coordinate green corridors across the network.
+      Per-node dynamics mirror task_urban_stochastic.
+      Score = mean across 9 nodes.
+    grader: weighted_composite_mean_9
+    score_range: [0.0, 1.0]
+    expected_baseline_score: 0.36
+
+  - id: task_grid_crisis
+    name: "Grid: Rush Hour Crisis (3x3)"
+    difficulty: hard
+    horizon: 1800
+    obs_dim: 73
+    grid_mode: true
+    n_agents: 9
+    description: >
+      Nine intersections under maximum load — rain, blocked lane per node,
+      near-saturation arrivals. Early termination if any node sustains
+      gridlock for 20 steps. Score = mean across 9 nodes.
+    grader: weighted_composite_mean_9
+    score_range: [0.0, 1.0]
+    expected_baseline_score: 0.24
+
 # ─────────────────────────────────────────────
 # Episode Configuration
 # ─────────────────────────────────────────────
@@ -237,8 +335,80 @@ episode:
   termination_conditions:
     - horizon_reached: "step_count >= horizon"
     - sustained_gridlock: "gridlock_steps >= 20 AND is_gridlock"
+    - marl_any_node_gridlock: >
+        In MARL grid tasks, episode terminates if ANY node sustains
+        gridlock for 20 consecutive steps.
   reset: stochastic_seed_or_fixed
   seeding: supported
+
+# ─────────────────────────────────────────────
+# Features
+# ─────────────────────────────────────────────
+features:
+  marl_grid:
+    description: >
+      3x3 grid of 9 cooperating traffic agents. Activate via grid_mode=true
+      in /reset or use MARL task IDs directly.
+    endpoints: [/reset, /ab_reset, /ab_step]
+
+  emergency_preemption:
+    description: >
+      Emergency vehicle (ambulance/fire/police) dispatched through the grid.
+      BFS route planned; preemption signals lock intersection phases ahead
+      of vehicle arrival. Active emergencies create a green corridor.
+    endpoints: [/emergency]
+
+  weather_control:
+    description: >
+      Live mid-episode weather toggle. Affects discharge multipliers and
+      arrival variance. Modes: CLEAR (1.0x), RAIN (0.75x), HEAVY_RAIN (0.60x),
+      FOG (0.85x). Can be changed any step without resetting the episode.
+    endpoints: [/weather]
+    discharge_multipliers:
+      CLEAR: 1.00
+      RAIN: 0.75
+      HEAVY_RAIN: 0.60
+      FOG: 0.85
+
+  incident_injection:
+    description: >
+      Lane-level incident simulation. BLOCKAGE sets sat_flow=0,
+      BREAKDOWN sets sat_flow=0.5x, DEMAND_SPIKE adds +0.4 to arrival lambda.
+      Auto-clears after duration_steps.
+    endpoints: [/incident]
+
+  llm_meta_controller:
+    description: >
+      Natural language traffic management commands interpreted by an LLM.
+      Translates to phase overrides and reward weight deltas injected into
+      the environment for a specified duration. Requires OPENAI_API_KEY.
+    endpoints: [/commander, /narrate]
+
+  impact_tracking:
+    description: >
+      Per-session CO₂, fuel, and economic impact calculator relative to a
+      fixed-cycle baseline. Constants: petrol idle burn 0.5 ml/s, CO₂ per ml
+      petrol 2.31g, ₹95/litre, 1 tree absorbs 21kg CO₂/year.
+    endpoints: [/grader, /narrate]
+
+  ab_comparison:
+    description: >
+      Paired MARL vs fixed-cycle baseline sessions from identical seeds.
+      Step both simultaneously and compare delta metrics.
+    endpoints: [/ab_reset, /ab_step]
+
+  visualiser_3d:
+    description: >
+      BabylonJS/Three.js 3D WebGL dashboard. Polls /state every 500ms.
+      Displays signal colours, queue visual counts, weather particles,
+      and green corridor overlay for emergency vehicles.
+    endpoints: [/viz, /viz3d, /state]
+
+  lstm_predictor:
+    description: >
+      Pure NumPy LSTM predictor (no PyTorch/TF). Provides 12-dim inflow
+      predictions per MARL agent. Trains offline at end of each episode
+      and serialises weights to app/api/lstm_weights.json.
 
 # ─────────────────────────────────────────────
 # API Endpoints
@@ -247,30 +417,147 @@ api:
   framework: FastAPI
   base_url: "/"
   endpoints:
+    # Core OpenEnv
     - path: /reset
       method: POST
-      description: Initialize new episode session
+      description: >
+        Initialize new episode session. Set grid_mode=true for MARL 3x3 grid.
+      params: [task_id, seed, grid_mode]
+
     - path: /step
       method: POST
-      description: Apply action, advance simulation
+      description: Apply single-node action, advance simulation one step
+      params: [session_id, action]
+
     - path: /state
       method: GET
-      description: Current full environment state
+      description: >
+        Current full environment state including render_hints block
+        (signal_colors, queue_visual_counts, weather_mode,
+        corridor_active, corridor_path).
+      params: [session_id]
+
     - path: /tasks
       method: GET
-      description: List all tasks with action/observation schemas
+      description: List all 6 tasks with action/observation schemas
+
+    - path: /tasks/{task_id}
+      method: GET
+      description: Get specification for a specific task
+
     - path: /grader
       method: POST
-      description: Compute episode score [0,1]
+      description: >
+        Compute episode score [0,1] with sub-scores and impact_summary
+        (co2_saved_g, fuel_saved_ml, economic_value_inr, trees_equivalent).
+      params: [session_id]
+
     - path: /baseline
       method: POST
-      description: Run baseline policy evaluation
+      description: Run baseline policy evaluation (pressure/fixed_cycle/random)
+      params: [task_id, policy, seed, use_llm]
+
+    - path: /analytics
+      method: GET
+      description: >
+        Rich episode analytics: phase stats, LOS breakdown, time-series,
+        emissions, green split, efficiency vs theoretical maximum.
+      params: [session_id]
+
+    - path: /benchmark
+      method: POST
+      description: Multi-seed reproducibility benchmark with mean±std score
+      params: [task_id, seeds]
+
+    # MARL / Grid
+    - path: /ab_reset
+      method: POST
+      description: >
+        Create paired MARL session and fixed-cycle baseline session from
+        identical seeds for A/B comparison.
+      params: [task_id, seed]
+
+    - path: /ab_step
+      method: POST
+      description: >
+        Step both MARL and baseline sessions simultaneously.
+        Returns delta_score, delta_throughput, delta_avg_delay.
+      params: [marl_session_id, baseline_session_id, marl_actions]
+
+    # Feature toggles
+    - path: /weather
+      method: POST
+      description: >
+        Toggle weather mode mid-episode. Modes: CLEAR, RAIN, HEAVY_RAIN, FOG.
+        Returns discharge_multiplier and projected_throughput_change.
+      params: [session_id, mode]
+
+    - path: /incident
+      method: POST
+      description: >
+        Inject lane incident. Types: BLOCKAGE, BREAKDOWN, DEMAND_SPIKE.
+        Auto-clears after duration_steps.
+      params: [session_id, node_id, lane_id, incident_type, duration_steps]
+
+    # Emergency vehicle
+    - path: /emergency
+      method: POST
+      description: >
+        Dispatch emergency vehicle through grid. Returns BFS path,
+        preemption schedule, and vehicle_id. Attaches to session;
+        scheduler ticks automatically on each /step call.
+      params: [session_id, entry_node, dest_node, vehicle_type]
+
+    # LLM Commander
+    - path: /commander
+      method: POST
+      description: >
+        Natural language traffic command interpreted by LLM (OpenAI).
+        Returns llm_reasoning, actions_injected, override_duration,
+        affected_nodes. Requires OPENAI_API_KEY.
+      params: [session_id, natural_language_command]
+
+    - path: /narrate
+      method: POST
+      description: >
+        Generate 3-sentence human-readable impact narrative for current episode.
+        Returns narrative_text, co2_saved_g, fuel_saved_ml,
+        economic_value_inr, trees_equivalent.
+      params: [session_id]
+
+    # Visualisation
     - path: /viz
       method: GET
-      description: Live visualisation dashboard
+      description: Live BabylonJS 3D traffic simulation dashboard
+
+    - path: /viz3d
+      method: GET
+      description: >
+        Three.js WebGL 3D visualiser page. Polls /state every 500ms.
+        Renders signal colours, queue volumes, rain particles (weather),
+        and green corridor overlay (emergency vehicles).
+
+    - path: /viz/snapshot
+      method: GET
+      description: Lightweight visualisation-ready data snapshot
+      params: [session_id]
+
+    # Admin
     - path: /health
       method: GET
-      description: Service health check
+      description: Service health check with active session count
+
+    - path: /sessions
+      method: GET
+      description: List all active sessions with type (single/marl)
+
+    - path: /save_weights
+      method: POST
+      description: Persist DQN weights to disk and HuggingFace Hub
+
+    - path: /load_weights
+      method: GET
+      description: Load DQN weights from disk or HuggingFace Hub
 
 # ─────────────────────────────────────────────
 # Deployment
@@ -280,6 +567,17 @@ deployment:
   framework: "FastAPI + Uvicorn"
   port: 7860
   health_endpoint: /health
+  environment_variables:
+    required: []
+    optional:
+      - name: OPENAI_API_KEY
+        description: >
+          Required for /commander and /narrate LLM endpoints.
+          If absent those endpoints return HTTP 503.
+      - name: HF_TOKEN
+        description: HuggingFace token for DQN weight persistence across restarts
+      - name: HF_REPO_ID
+        description: HuggingFace repo for weight storage (default: your-username/your-repo-name)
 
 # ─────────────────────────────────────────────
 # References
@@ -289,3 +587,4 @@ references:
   - "Webster, F.V. (1958). Traffic signal settings. Road Research Technical Paper No. 39."
   - "Sutton, R.S. & Barto, A.G. (2018). Reinforcement Learning: An Introduction. 2nd ed."
   - "Lowrie, P.R. (1990). SCATS - Sydney Coordinated Adaptive Traffic System."
+  - "Hochreiter, S. & Schmidhuber, J. (1997). Long Short-Term Memory. Neural Computation."

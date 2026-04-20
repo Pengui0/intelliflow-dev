@@ -2,19 +2,12 @@
 """
 IntelliFlow Baseline Inference Script
 =====================================
-Runs the OpenAI-powered LLM agent (and pressure/fixed-cycle baselines)
+Runs the LLM agent (and pressure/fixed-cycle baselines)
 across all three tasks and outputs reproducible baseline scores.
 
 Usage:
-    python baseline_inference.py [--task all|<task_id>] [--policy pressure|fixed_cycle|random|llm]
-                                  [--seed 42] [--host http://localhost:7860]
-
-Requirements:
-    pip install openai requests
-
-Environment variables:
-    OPENAI_API_KEY  — required for --policy llm
-    INTELLIFLOW_HOST — optional override for API host
+    python inference.py [--task all|<task_id>] [--policy pressure|fixed_cycle|random|llm]
+                        [--seed 42] [--host http://localhost:7860]
 """
 
 from __future__ import annotations
@@ -24,8 +17,6 @@ import json
 import os
 import sys
 import time
-import random
-import math
 from typing import Any, Dict, List, Optional
 
 try:
@@ -34,163 +25,128 @@ except ImportError:
     print("ERROR: 'requests' package not found. Install with: pip install requests")
     sys.exit(1)
 
+from app.baseline.policies import PressurePolicy, FixedCyclePolicy, RandomPolicy, LLMPolicy
+import numpy as np
+
+# Resolve weights path robustly regardless of CWD or execution context.
+# Priority: (1) env var override, (2) path relative to this file's directory,
+# (3) path relative to CWD — covers both local dev and HF Spaces deployment.
+def _resolve_dqn_weights_path(explicit: str | None) -> str:
+    if explicit is not None:
+        return explicit
+    if "INTELLIFLOW_DQN_WEIGHTS" in os.environ:
+        return os.environ["INTELLIFLOW_DQN_WEIGHTS"]
+    candidates = [
+        os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "app", "api", "dqn_weights.json"
+        )),
+        os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "dqn_weights.json"
+        )),
+        os.path.abspath(os.path.join("app", "api", "dqn_weights.json")),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    # Return the most canonical path even if missing — error will be explicit
+    return candidates[0]
+
+
+class DQNPolicy:
+    """Loads trained DQN weights and acts greedily from Q-values."""
+    def __init__(self, weights_path: str = None):
+        weights_path = _resolve_dqn_weights_path(weights_path)
+        self._fallback = PressurePolicy()
+        self._q_weights = None
+        self._weights_path = weights_path
+        self._dqn_count = 0
+        self._fallback_count = 0
+        self._inference_latencies: List[float] = []
+        try:
+            with open(weights_path, "r") as f:
+                data = json.load(f)
+            self._q_weights = data
+            print(f"[DQNPolicy] Loaded weights from {weights_path}")
+        except FileNotFoundError:
+            print(f"[DQNPolicy] Weights not found at {weights_path} — falling back to pressure policy")
+            print(f"[DQNPolicy] Set INTELLIFLOW_DQN_WEIGHTS env var to override path")
+        except Exception as e:
+            print(f"[DQNPolicy] Could not load weights ({e}) — falling back to pressure policy")
+
+    def act(self, obs: dict) -> int:
+        if self._q_weights is None:
+            self._fallback_count += 1
+            return self._fallback.act(obs)
+        try:
+            vec = obs.get("observation_vector", None)
+            if vec is None:
+                self._fallback_count += 1
+                print("[DQNPolicy] WARNING: observation_vector missing — using fallback", flush=True)
+                return self._fallback.act(obs)
+
+            x = np.array(vec, dtype=np.float32)
+
+            # Validate input shape against first layer
+            layers = self._q_weights.get("layers", [])
+            if layers:
+                expected_in = np.array(layers[0]["W"], dtype=np.float32).shape[1]
+                if x.shape[0] != expected_in:
+                    self._fallback_count += 1
+                    print(f"[DQNPolicy] WARNING: input dim {x.shape[0]} != expected {expected_in} — using fallback", flush=True)
+                    return self._fallback.act(obs)
+
+            t0 = time.time()
+            for layer in layers:
+                W = np.array(layer["W"], dtype=np.float32)
+                b = np.array(layer["b"], dtype=np.float32)
+                x = np.dot(x, W.T) + b
+                if layer.get("activation") == "relu":
+                    x = np.maximum(0, x)
+            latency_ms = (time.time() - t0) * 1000
+            self._inference_latencies.append(latency_ms)
+            self._dqn_count += 1
+
+            action = int(np.argmax(x))
+            q_spread = float(np.max(x) - np.min(x))
+            if q_spread < 0.01:
+                print(f"[DQNPolicy] WARNING: Q-values nearly uniform (spread={q_spread:.4f}), confidence low", flush=True)
+            return action
+
+        except Exception as e:
+            self._fallback_count += 1
+            print(f"[DQNPolicy] ERROR in forward pass: {e} — using fallback", flush=True)
+            return self._fallback.act(obs)
+
+    def stats(self) -> dict:
+        total = self._dqn_count + self._fallback_count
+        avg_lat = (
+            sum(self._inference_latencies) / len(self._inference_latencies)
+            if self._inference_latencies else 0.0
+        )
+        return {
+            "dqn_calls":        self._dqn_count,
+            "fallback_calls":   self._fallback_count,
+            "dqn_usage_pct":    round(self._dqn_count / max(total, 1) * 100, 1),
+            "avg_latency_ms":   round(avg_lat, 3),
+            "weights_path":     self._weights_path,
+        }
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 DEFAULT_HOST = os.environ.get("INTELLIFLOW_HOST", "http://localhost:7860")
-API_BASE_URL = os.environ.get("API_BASE_URL")
 MODEL_NAME   = os.environ.get("MODEL_NAME", "gpt-4o-mini")
-HF_TOKEN     = os.environ.get("HF_TOKEN")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
 TASKS = [
     "task_suburban_steady",
     "task_urban_stochastic",
     "task_rush_hour_crisis",
 ]
 
-LANE_NAMES = [
-    "N_through", "N_right", "S_through", "S_right",
-    "E_through", "E_right", "W_through", "W_right",
-    "N_left",    "S_left",  "E_left",    "W_left",
-]
-
 
 # ---------------------------------------------------------------------------
-# Inline policies (no server dependency for action selection)
-# ---------------------------------------------------------------------------
-
-class PressurePolicy:
-    def __init__(self, switch_threshold: float = 3.0, min_steps: int = 5):
-        self.threshold = switch_threshold
-        self.min_steps = min_steps
-        self._steps = 0
-
-    def act(self, obs: Dict) -> int:
-        self._steps += 1
-        ql = obs.get("queue_lengths", [0.0]*12)
-        phase_oh = obs.get("phase_onehot", [1,0,0,0])
-        idx = phase_oh.index(max(phase_oh))
-        elapsed_norm = obs.get("phase_elapsed_norm", 0)
-        elapsed = elapsed_norm * 90
-
-        if elapsed < self.min_steps:
-            return 0  # MAINTAIN
-
-        ns = sum(ql[i] for i in [0,1,2,3,8,9])
-        ew = sum(ql[i] for i in [4,5,6,7,10,11])
-
-        if idx == 2:  # ALL_RED
-            return 0
-        if idx == 0 and ew - ns > self.threshold * 0.1:
-            self._steps = 0
-            return 1
-        if idx == 1 and ns - ew > self.threshold * 0.1:
-            self._steps = 0
-            return 1
-        # Extend if high pressure on current
-        if idx == 0 and ns > 0.75:
-            return 2
-        if idx == 1 and ew > 0.75:
-            return 2
-        return 0
-
-
-class FixedCyclePolicy:
-    def __init__(self, ns_green: int = 30, ew_green: int = 30, amber: int = 3):  # ← amber added
-        self.ns_green = ns_green
-        self.ew_green = ew_green
-        self.amber = amber    # ← initialised
-        self._step = 0
-
-    def act(self, obs: Dict) -> int:
-        self._step += 1
-        cycle = self.ns_green + self.amber + self.ew_green + self.amber
-        pos = self._step % cycle
-
-        if pos == self.ns_green: return 3
-        if pos == self.ns_green + self.amber: return 1
-        if pos == self.ns_green + self.amber + self.ew_green: return 3
-        if pos == 0: return 1
-        return 0
-
-
-class RandomPolicy:
-    def __init__(self, seed: int = 42):
-        self._rng = random.Random(seed)
-
-    def act(self, obs: Dict) -> int:
-        return self._rng.randint(0, 4)
-
-
-class LLMPolicy:
-    SYSTEM = (
-        "You are an expert traffic signal controller AI. "
-        "Control a 4-way intersection to maximise throughput and minimise delay.\n"
-        "Actions: 0=MAINTAIN, 1=SWITCH_PHASE, 2=EXTEND_GREEN, 3=FORCE_ALL_RED, 4=YIELD_MINOR\n"
-        "Respond ONLY with JSON: {\"action\": <0-4>}"
-    )
-
-    def __init__(self, model: str = None):                              # ← CHANGED
-        self.model = model or os.environ.get("MODEL_NAME", "gpt-4o-mini")  # ← CHANGED
-        self._fallback = PressurePolicy()
-        self.calls = 0
-        self.latencies: List[float] = []
-
-        try:
-            import openai
-            self._client = openai.OpenAI(
-                api_key=os.environ.get("API_KEY") or os.environ.get("OPENAI_API_KEY", ""),
-                base_url=os.environ.get("API_BASE_URL") or None,
-            )
-            self._available = True
-        except ImportError:
-            print("WARNING: openai package not installed. Falling back to pressure policy.")
-            self._available = False
-
-    def act(self, obs: Dict) -> int:
-        if not self._available:
-            return self._fallback.act(obs)
-
-        try:
-            ql = obs.get("queue_lengths", [])
-            phase_oh = obs.get("phase_onehot", [1,0,0,0])
-            phase_names = ["NS_GREEN","EW_GREEN","ALL_RED","NS_MINOR"]
-            phase = phase_names[phase_oh.index(max(phase_oh))]
-            queue_map = {LANE_NAMES[i]: round(ql[i], 2) for i in range(min(len(ql),12))}
-
-            msg = (
-                f"Phase: {phase} | "
-                f"Elapsed(norm): {obs.get('phase_elapsed_norm',0):.2f} | "
-                f"Queues: {json.dumps(queue_map)} | "
-                f"Pressure NS-EW: {obs.get('pressure_differential',0):.3f} | "
-                f"Fairness: {obs.get('fairness_score',0):.3f}"
-            )
-
-            t0 = time.time()
-            resp = self._client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.SYSTEM},
-                    {"role": "user", "content": msg},
-                ],
-                max_tokens=50,
-                temperature=0.0,
-            )
-            self.latencies.append(time.time() - t0)
-            self.calls += 1
-
-            content = resp.choices[0].message.content.strip()
-            parsed = json.loads(content)
-            action = int(parsed.get("action", 0))
-            return max(0, min(4, action))
-        except Exception as e:
-            return self._fallback.act(obs)
-
-
-# ---------------------------------------------------------------------------
-# Episode runner (direct API calls)
+# API Client
 # ---------------------------------------------------------------------------
 
 class IntelliFlowClient:
@@ -202,7 +158,7 @@ class IntelliFlowClient:
         return self.session.get(f"{self.host}/health", timeout=10).json()
 
     def reset(self, task_id: str, seed: Optional[int] = None) -> Dict:
-        body = {"task_id": task_id}
+        body: Dict[str, Any] = {"task_id": task_id}
         if seed is not None:
             body["seed"] = seed
         r = self.session.post(f"{self.host}/reset", json=body, timeout=10)
@@ -231,6 +187,10 @@ class IntelliFlowClient:
         return self.session.get(f"{self.host}/tasks", timeout=10).json()
 
 
+# ---------------------------------------------------------------------------
+# Episode runner
+# ---------------------------------------------------------------------------
+
 def run_episode(
     client: IntelliFlowClient,
     task_id: str,
@@ -240,12 +200,10 @@ def run_episode(
 ) -> Dict[str, Any]:
     """Run one complete episode, return scored result."""
 
-    # Reset
     reset_data = client.reset(task_id, seed=seed)
     session_id = reset_data["session_id"]
     horizon = reset_data.get("horizon", 600)
 
-    # Build policy
     if policy_name == "pressure":
         policy = PressurePolicy()
     elif policy_name == "fixed_cycle":
@@ -254,6 +212,8 @@ def run_episode(
         policy = RandomPolicy(seed=seed)
     elif policy_name == "llm":
         policy = LLMPolicy()
+    elif policy_name == "dqn":
+        policy = DQNPolicy()
     else:
         raise ValueError(f"Unknown policy: {policy_name}")
 
@@ -261,11 +221,11 @@ def run_episode(
     step_count = 0
     done = False
     obs = reset_data.get("observation", {})
-    rewards = []
-
+    rewards: List[float] = []
     t_start = time.time()
 
     print(f"[START] task={task_id} env=intelliflow model={MODEL_NAME or policy_name}", flush=True)
+
     while not done:
         action = policy.act(obs)
         step_data = client.step(session_id, action)
@@ -278,31 +238,51 @@ def run_episode(
         total_reward += reward
         rewards.append(reward)
         step_count += 1
+
         print(f"[STEP] step={step_count} action={json.dumps(action)} reward={reward:.2f} done={str(done).lower()} error=null", flush=True)
 
         if verbose and step_count % 100 == 0:
             print(f"  Step {step_count:4d}/{horizon} | "
                   f"Reward: {reward:+7.3f} | "
-                  f"Cleared: {info.get('total_cleared',0):5d} | "
-                  f"Phase: {info.get('phase','?'):<10s} | "
-                  f"Delay: {info.get('avg_delay',0):.1f}s")
+                  f"Cleared: {info.get('total_cleared', 0):5d} | "
+                  f"Phase: {info.get('phase', '?'):<10s} | "
+                  f"Delay: {info.get('avg_delay', 0):.1f}s")
 
     elapsed = time.time() - t_start
-
-    # Grade
     grade_data = client.grade(session_id)
+
+    # Emit reward curve for training loop visibility
+    window = 50
+    smoothed = []
+    for i in range(len(rewards)):
+        w = rewards[max(0, i - window): i + 1]
+        smoothed.append(round(sum(w) / len(w), 4))
+    print(f"[REWARD_CURVE] {json.dumps(smoothed)}", flush=True)
     print(f"[END] success=true steps={step_count} score={grade_data.get('score', 0.0):.3f} rewards={','.join(f'{r:.3f}' for r in rewards)}", flush=True)
 
-    result = {
+    log_path = "inference_reward_log.jsonl"
+    with open(log_path, "a") as logf:
+        logf.write(json.dumps({
+            "task_id":    task_id,
+            "policy":     policy_name,
+            "seed":       seed,
+            "score":      grade_data.get("score", 0.0),
+            "steps":      step_count,
+            "reward_mean": round(sum(rewards)/max(len(rewards),1), 4),
+        }) + "\n")
+
+    n = max(len(rewards), 1)
+    mean_r = sum(rewards) / n
+    std_r = (sum((r - mean_r) ** 2 for r in rewards) / n) ** 0.5 if rewards else 0.0
+
+    result: Dict[str, Any] = {
         "task_id": task_id,
         "policy": policy_name,
         "seed": seed,
         "steps": step_count,
         "total_reward": round(total_reward, 4),
-        "reward_mean": round(sum(rewards)/max(len(rewards),1), 4),
-        "reward_std": round(
-            (sum((r - sum(rewards)/len(rewards))**2 for r in rewards)/max(len(rewards),1))**0.5, 4
-        ) if rewards else 0,
+        "reward_mean": round(mean_r, 4),
+        "reward_std": round(std_r, 4),
         "score": grade_data.get("score", 0.0),
         "sub_scores": grade_data.get("sub_scores", {}),
         "trajectory_summary": grade_data.get("trajectory_summary", {}),
@@ -312,8 +292,13 @@ def run_episode(
     if policy_name == "llm" and hasattr(policy, "calls"):
         result["llm_calls"] = policy.calls
         result["llm_avg_latency_ms"] = round(
-            sum(policy.latencies)/max(len(policy.latencies),1)*1000, 1
+            sum(policy.latencies) / max(len(policy.latencies), 1) * 1000, 1
         )
+    if policy_name == "dqn" and hasattr(policy, "stats"):
+        result["dqn_stats"] = policy.stats()
+        print(f"  │ DQN usage   : {result['dqn_stats']['dqn_usage_pct']}%")
+        print(f"  │ DQN latency : {result['dqn_stats']['avg_latency_ms']}ms avg")
+        print(f"  │ Fallbacks   : {result['dqn_stats']['fallback_calls']}")
 
     return result
 
@@ -323,30 +308,18 @@ def run_episode(
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="IntelliFlow baseline inference script"
-    )
-    parser.add_argument(
-        "--task", default="all",
-        help="Task ID or 'all' (default: all)"
-    )
-    parser.add_argument(
-        "--policy", default="llm",
-        choices=["pressure", "fixed_cycle", "random", "llm"],
-        help="Policy to evaluate (default: llm)"
-    )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument(
-        "--host", default=DEFAULT_HOST,
-        help=f"API host (default: {DEFAULT_HOST})"
-    )
+    parser = argparse.ArgumentParser(description="IntelliFlow baseline inference script")
+    parser.add_argument("--task", default="all", help="Task ID or 'all' (default: all)")
+    parser.add_argument("--policy", default="dqn",
+                        choices=["pressure", "fixed_cycle", "random", "llm", "dqn"])
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--verbose", action="store_true", default=True)
     parser.add_argument("--output", default=None, help="JSON output file path")
     args = parser.parse_args()
 
     client = IntelliFlowClient(args.host)
 
-    # Health check
     print(f"\n{'='*60}")
     print("  IntelliFlow Baseline Inference")
     print(f"{'='*60}")
@@ -357,7 +330,7 @@ def main():
 
     try:
         health = client.health()
-        print(f"  ✓ Service online | Uptime: {health.get('uptime_seconds',0)}s")
+        print(f"  ✓ Service online | Uptime: {health.get('uptime_seconds', 0)}s")
         print(f"  ✓ Tasks: {', '.join(health.get('tasks_available', []))}")
     except Exception as e:
         print(f"  ✗ Health check failed: {e}")
@@ -365,7 +338,7 @@ def main():
         sys.exit(1)
 
     tasks = TASKS if args.task == "all" else [args.task]
-    all_results = []
+    all_results: List[Dict[str, Any]] = []
 
     for task_id in tasks:
         print(f"\n{'─'*60}")
@@ -373,14 +346,12 @@ def main():
         print(f"{'─'*60}")
 
         try:
-            result = run_episode(
-                client, task_id, args.policy, args.seed, args.verbose
-            )
+            result = run_episode(client, task_id, args.policy, args.seed, args.verbose)
             all_results.append(result)
 
             score = result["score"]
             bar = "█" * int(score * 30) + "░" * (30 - int(score * 30))
-            print(f"\n  ┌─ RESULT ─────────────────────────────")
+            print("\n  ┌─ RESULT ─────────────────────────────")
             print(f"  │ Score       : {score:.4f}  [{bar}]")
             print(f"  │ Steps       : {result['steps']}")
             print(f"  │ Total reward: {result['total_reward']}")
@@ -394,13 +365,17 @@ def main():
             if "llm_calls" in result:
                 print(f"  │ LLM calls   : {result['llm_calls']}")
                 print(f"  │ LLM latency : {result['llm_avg_latency_ms']}ms avg")
-            print(f"  └──────────────────────────────────────")
+            if "dqn_stats" in result:
+                s = result["dqn_stats"]
+                print(f"  │ DQN usage   : {s['dqn_usage_pct']}% ({s['dqn_calls']} calls)")
+                print(f"  │ DQN latency : {s['avg_latency_ms']}ms avg")
+                print(f"  │ Fallbacks   : {s['fallback_calls']}")
+            print("  └──────────────────────────────────────")
 
         except Exception as e:
             print(f"  ✗ Error: {e}")
             import traceback; traceback.print_exc()
 
-    # Summary table
     if len(all_results) > 1:
         print(f"\n{'='*60}")
         print("  SUMMARY")
@@ -414,12 +389,10 @@ def main():
         print(f"  {'Average':<35s} {sum(scores)/len(scores):>8.4f}")
         print()
 
-    # Output JSON
-    output_path = args.output
-    if output_path:
-        with open(output_path, "w") as f:
+    if args.output:
+        with open(args.output, "w") as f:
             json.dump({"results": all_results, "policy": args.policy, "seed": args.seed}, f, indent=2)
-        print(f"  Results written to: {output_path}")
+        print(f"  Results written to: {args.output}")
     else:
         print("\n  Full JSON results:")
         print(json.dumps({"results": all_results}, indent=2))

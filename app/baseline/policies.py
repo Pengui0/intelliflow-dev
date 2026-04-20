@@ -1,51 +1,10 @@
-#!/usr/bin/env python3
-"""
-IntelliFlow Baseline Inference Script
-=====================================
-Runs the OpenAI-powered LLM agent (and pressure/fixed-cycle baselines)
-across all three tasks and outputs reproducible baseline scores.
-
-Usage:
-    python baseline_inference.py [--task all|<task_id>] [--policy pressure|fixed_cycle|random|llm]
-                                  [--seed 42] [--host http://localhost:7860]
-
-Requirements:
-    pip install openai requests
-
-Environment variables:
-    OPENAI_API_KEY  — required for --policy llm
-    INTELLIFLOW_HOST — optional override for API host
-"""
-
 from __future__ import annotations
 
-import argparse
 import json
 import os
-import sys
 import time
 import random
-import math
-from typing import Any, Dict, List, Optional
-
-try:
-    import requests
-except ImportError:
-    print("ERROR: 'requests' package not found. Install with: pip install requests")
-    sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-DEFAULT_HOST = os.environ.get("INTELLIFLOW_HOST", "http://localhost:7860")
-
-TASKS = [
-    "task_suburban_steady",
-    "task_urban_stochastic",
-    "task_rush_hour_crisis",
-]
+from typing import Dict, List
 
 LANE_NAMES = [
     "N_through", "N_right", "S_through", "S_right",
@@ -54,11 +13,9 @@ LANE_NAMES = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Inline policies (no server dependency for action selection)
-# ---------------------------------------------------------------------------
-
 class PressurePolicy:
+    POLICY_NAME = "pressure"
+
     def __init__(self, switch_threshold: float = 3.0, min_steps: int = 5):
         self.threshold = switch_threshold
         self.min_steps = min_steps
@@ -66,8 +23,8 @@ class PressurePolicy:
 
     def act(self, obs: Dict) -> int:
         self._steps += 1
-        ql = obs.get("queue_lengths", [0.0]*12)
-        phase_oh = obs.get("phase_onehot", [1,0,0,0])
+        ql = obs.get("queue_lengths", [0.0] * 12)
+        phase_oh = obs.get("phase_onehot", [1, 0, 0, 0])
         idx = phase_oh.index(max(phase_oh))
         elapsed_norm = obs.get("phase_elapsed_norm", 0)
         elapsed = elapsed_norm * 90
@@ -75,8 +32,20 @@ class PressurePolicy:
         if elapsed < self.min_steps:
             return 0  # MAINTAIN
 
-        ns = sum(ql[i] for i in [0,1,2,3,8,9])
-        ew = sum(ql[i] for i in [4,5,6,7,10,11])
+        ns = sum(ql[i] for i in [0, 1, 2, 3, 8, 9])
+        ew = sum(ql[i] for i in [4, 5, 6, 7, 10, 11])
+
+        # LSTM-augmented pressure: if obs_vector present (73-dim MARL obs),
+        # blend predicted future inflows into current queue pressure.
+        # Indices 57-68 are lstm_predictions (12 lanes, normalised 0-1).
+        obs_vec = obs.get("observation_vector", [])
+        if len(obs_vec) >= 69:
+            lstm_pred = obs_vec[57:69]
+            ns_pred = sum(lstm_pred[i] for i in [0, 1, 2, 3, 8, 9])
+            ew_pred = sum(lstm_pred[i] for i in [4, 5, 6, 7, 10, 11])
+            # Blend 70% current queue, 30% predicted future — forward-looking pressure
+            ns = 0.7 * ns + 0.3 * ns_pred
+            ew = 0.7 * ew + 0.3 * ew_pred
 
         if idx == 2:  # ALL_RED
             return 0
@@ -86,7 +55,6 @@ class PressurePolicy:
         if idx == 1 and ns - ew > self.threshold * 0.1:
             self._steps = 0
             return 1
-        # Extend if high pressure on current
         if idx == 0 and ns > 0.75:
             return 2
         if idx == 1 and ew > 0.75:
@@ -95,19 +63,25 @@ class PressurePolicy:
 
 
 class FixedCyclePolicy:
-    def __init__(self, ns_green: int = 30, ew_green: int = 30):
+    def __init__(self, ns_green: int = 30, ew_green: int = 30, amber: int = 3):
         self.ns_green = ns_green
         self.ew_green = ew_green
+        self.amber = amber
         self._step = 0
 
     def act(self, obs: Dict) -> int:
         self._step += 1
-        cycle = self.ns_green + 3 + self.ew_green + 3
+        cycle = self.ns_green + self.amber + self.ew_green + self.amber
         pos = self._step % cycle
-        if pos == self.ns_green: return 3       # FORCE_ALL_RED
-        if pos == self.ns_green + 3: return 1   # SWITCH
-        if pos == self.ns_green + 3 + self.ew_green: return 3
-        if pos == 0: return 1
+
+        if pos == self.ns_green:
+            return 3
+        if pos == self.ns_green + self.amber:
+            return 1
+        if pos == self.ns_green + self.amber + self.ew_green:
+            return 3
+        if pos == 0:
+            return 1
         return 0
 
 
@@ -127,8 +101,8 @@ class LLMPolicy:
         "Respond ONLY with JSON: {\"action\": <0-4>}"
     )
 
-    def __init__(self, model: str = "gpt-4o-mini"):
-        self.model = model
+    def __init__(self, model: str = None):
+        self.model = model or os.environ.get("MODEL_NAME", "gpt-4o-mini")
         self._fallback = PressurePolicy()
         self.calls = 0
         self.latencies: List[float] = []
@@ -150,17 +124,17 @@ class LLMPolicy:
 
         try:
             ql = obs.get("queue_lengths", [])
-            phase_oh = obs.get("phase_onehot", [1,0,0,0])
-            phase_names = ["NS_GREEN","EW_GREEN","ALL_RED","NS_MINOR"]
+            phase_oh = obs.get("phase_onehot", [1, 0, 0, 0])
+            phase_names = ["NS_GREEN", "EW_GREEN", "ALL_RED", "NS_MINOR"]
             phase = phase_names[phase_oh.index(max(phase_oh))]
-            queue_map = {LANE_NAMES[i]: round(ql[i], 2) for i in range(min(len(ql),12))}
+            queue_map = {LANE_NAMES[i]: round(ql[i], 2) for i in range(min(len(ql), 12))}
 
             msg = (
                 f"Phase: {phase} | "
-                f"Elapsed(norm): {obs.get('phase_elapsed_norm',0):.2f} | "
+                f"Elapsed(norm): {obs.get('phase_elapsed_norm', 0):.2f} | "
                 f"Queues: {json.dumps(queue_map)} | "
-                f"Pressure NS-EW: {obs.get('pressure_differential',0):.3f} | "
-                f"Fairness: {obs.get('fairness_score',0):.3f}"
+                f"Pressure NS-EW: {obs.get('pressure_differential', 0):.3f} | "
+                f"Fairness: {obs.get('fairness_score', 0):.3f}"
             )
 
             t0 = time.time()
@@ -180,242 +154,107 @@ class LLMPolicy:
             parsed = json.loads(content)
             action = int(parsed.get("action", 0))
             return max(0, min(4, action))
-        except Exception as e:
+        except Exception:
             return self._fallback.act(obs)
 
-
-# ---------------------------------------------------------------------------
-# Episode runner (direct API calls)
-# ---------------------------------------------------------------------------
-
-class IntelliFlowClient:
-    def __init__(self, host: str):
-        self.host = host.rstrip("/")
-        self.session = requests.Session()
-
-    def health(self) -> Dict:
-        return self.session.get(f"{self.host}/health", timeout=10).json()
-
-    def reset(self, task_id: str, seed: Optional[int] = None) -> Dict:
-        body = {"task_id": task_id}
-        if seed is not None:
-            body["seed"] = seed
-        r = self.session.post(f"{self.host}/reset", json=body, timeout=10)
-        r.raise_for_status()
-        return r.json()
-
-    def step(self, session_id: str, action: int) -> Dict:
-        r = self.session.post(
-            f"{self.host}/step",
-            json={"session_id": session_id, "action": action},
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json()
-
-    def grade(self, session_id: str) -> Dict:
-        r = self.session.post(
-            f"{self.host}/grader",
-            json={"session_id": session_id},
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json()
-
-    def get_tasks(self) -> Dict:
-        return self.session.get(f"{self.host}/tasks", timeout=10).json()
+    @property
+    def avg_latency_ms(self) -> float:
+        if not self.latencies:
+            return 0.0
+        return round(sum(self.latencies) / len(self.latencies) * 1000, 2)
 
 
-def run_episode(
-    client: IntelliFlowClient,
+async def run_baseline_episode(
     task_id: str,
-    policy_name: str,
-    seed: int,
-    verbose: bool = True,
-) -> Dict[str, Any]:
-    """Run one complete episode, return scored result."""
+    policy:  str  = "pressure",
+    seed:    int  = 42,
+    use_llm: bool = False,
+) -> dict:
+    """
+    Run one full episode with the given policy inside the server process.
+    Used by /baseline and /benchmark endpoints.
+    """
+    from app.tasks.registry import TASK_REGISTRY, EpisodeGrader, build_env
+    from app.core.session import Session
+    import uuid
 
-    # Reset
-    reset_data = client.reset(task_id, seed=seed)
-    session_id = reset_data["session_id"]
-    horizon = reset_data.get("horizon", 600)
+    if task_id not in TASK_REGISTRY:
+        raise ValueError(f"Unknown task_id {task_id!r}")
 
-    # Build policy
-    if policy_name == "pressure":
-        policy = PressurePolicy()
-    elif policy_name == "fixed_cycle":
-        policy = FixedCyclePolicy()
-    elif policy_name == "random":
-        policy = RandomPolicy(seed=seed)
-    elif policy_name == "llm":
-        policy = LLMPolicy()
+    spec = TASK_REGISTRY[task_id]
+    if spec.env_config.get("grid_mode", False):
+        raise ValueError(f"Task {task_id!r} is a grid task — use /reset with grid_mode=true")
+
+    env = build_env(task_id, seed=seed)
+    env.reset(seed=seed)
+
+    if use_llm or policy == "llm":
+        agent = LLMPolicy()
+    elif policy == "fixed_cycle":
+        agent = FixedCyclePolicy()
+    elif policy == "random":
+        agent = RandomPolicy(seed=seed)
     else:
-        raise ValueError(f"Unknown policy: {policy_name}")
+        agent = PressurePolicy()
+
+    from app.core.impact_calculator import ImpactCalculator
+    impact = ImpactCalculator(baseline="fixed_cycle")
 
     total_reward = 0.0
-    step_count = 0
-    done = False
-    obs = reset_data.get("observation", {})
-    rewards = []
+    rewards      = []
+    done         = False
 
-    t_start = time.time()
+    obs_obj = env._build_observation()
+    obs     = obs_obj.to_dict()
 
     while not done:
-        action = policy.act(obs)
-        step_data = client.step(session_id, action)
-
-        obs = step_data.get("observation", {})
-        reward = step_data.get("reward", 0.0)
-        done = step_data.get("done", False)
-        info = step_data.get("info", {})
-
-        total_reward += reward
+        action              = agent.act(obs)
+        obs_obj, reward, done, info = env.step(action)
+        obs                 = obs_obj.to_dict()
+        total_reward       += reward
         rewards.append(reward)
-        step_count += 1
-
-        if verbose and step_count % 100 == 0:
-            print(f"  Step {step_count:4d}/{horizon} | "
-                  f"Reward: {reward:+7.3f} | "
-                  f"Cleared: {info.get('total_cleared',0):5d} | "
-                  f"Phase: {info.get('phase','?'):<10s} | "
-                  f"Delay: {info.get('avg_delay',0):.1f}s")
-
-    elapsed = time.time() - t_start
-
-    # Grade
-    grade_data = client.grade(session_id)
-
-    result = {
-        "task_id": task_id,
-        "policy": policy_name,
-        "seed": seed,
-        "steps": step_count,
-        "total_reward": round(total_reward, 4),
-        "reward_mean": round(sum(rewards)/max(len(rewards),1), 4),
-        "reward_std": round(
-            (sum((r - sum(rewards)/len(rewards))**2 for r in rewards)/max(len(rewards),1))**0.5, 4
-        ) if rewards else 0,
-        "score": grade_data.get("score", 0.0),
-        "sub_scores": grade_data.get("sub_scores", {}),
-        "trajectory_summary": grade_data.get("trajectory_summary", {}),
-        "wall_time_seconds": round(elapsed, 2),
-    }
-
-    if policy_name == "llm" and hasattr(policy, "calls"):
-        result["llm_calls"] = policy.calls
-        result["llm_avg_latency_ms"] = round(
-            sum(policy.latencies)/max(len(policy.latencies),1)*1000, 1
+        impact.update(
+            idle_queue=info.get("total_queue", 0.0),
+            arrived_this_step=info.get("step_arrived", 0),
+            cleared_this_step=info.get("step_cleared", 0),
         )
 
-    return result
+    analytics = env.analytics()
+    summary   = analytics["episode_summary"]
+    steps     = len(rewards)
 
+    trajectory = {
+        "total_cleared":           summary["total_cleared"],
+        "total_arrived":           summary["total_arrived"],
+        "steps_survived":          steps,
+        "avg_delay":               summary["avg_delay_s"],
+        "switch_count":            summary["phase_switches"],
+        "peak_spillback_fraction": summary["peak_spillback_lanes"] / 12.0,
+        "fairness_score":          1.0 - env._fairness_score(),
+        "gridlock_terminated":     env._is_gridlock() and done,
+    }
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+    grader = EpisodeGrader(spec)
+    grade  = grader.grade(trajectory)
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="IntelliFlow baseline inference script"
-    )
-    parser.add_argument(
-        "--task", default="all",
-        help="Task ID or 'all' (default: all)"
-    )
-    parser.add_argument(
-        "--policy", default="llm",
-        choices=["pressure", "fixed_cycle", "random", "llm"],
-        help="Policy to evaluate (default: llm)"
-    )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument(
-        "--host", default=DEFAULT_HOST,
-        help=f"API host (default: {DEFAULT_HOST})"
-    )
-    parser.add_argument("--verbose", action="store_true", default=True)
-    parser.add_argument("--output", default=None, help="JSON output file path")
-    args = parser.parse_args()
+    n      = max(len(rewards), 1)
+    mean_r = sum(rewards) / n
 
-    client = IntelliFlowClient(args.host)
-
-    # Health check
-    print(f"\n{'='*60}")
-    print("  IntelliFlow Baseline Inference")
-    print(f"{'='*60}")
-    print(f"  Host   : {args.host}")
-    print(f"  Policy : {args.policy}")
-    print(f"  Seed   : {args.seed}")
-    print()
-
-    try:
-        health = client.health()
-        print(f"  ✓ Service online | Uptime: {health.get('uptime_seconds',0)}s")
-        print(f"  ✓ Tasks: {', '.join(health.get('tasks_available', []))}")
-    except Exception as e:
-        print(f"  ✗ Health check failed: {e}")
-        print("  Make sure the server is running: python -m uvicorn app.api.main:app --port 7860")
-        sys.exit(1)
-
-    tasks = TASKS if args.task == "all" else [args.task]
-    all_results = []
-
-    for task_id in tasks:
-        print(f"\n{'─'*60}")
-        print(f"  Task: {task_id}")
-        print(f"{'─'*60}")
-
-        try:
-            result = run_episode(
-                client, task_id, args.policy, args.seed, args.verbose
-            )
-            all_results.append(result)
-
-            score = result["score"]
-            bar = "█" * int(score * 30) + "░" * (30 - int(score * 30))
-            print(f"\n  ┌─ RESULT ─────────────────────────────")
-            print(f"  │ Score       : {score:.4f}  [{bar}]")
-            print(f"  │ Steps       : {result['steps']}")
-            print(f"  │ Total reward: {result['total_reward']}")
-            print(f"  │ Reward mean : {result['reward_mean']}")
-            for k, v in result.get("sub_scores", {}).items():
-                print(f"  │  └ {k:<30s}: {v:.4f}")
-            traj = result.get("trajectory_summary", {})
-            print(f"  │ Cleared     : {traj.get('total_cleared', '?')}")
-            print(f"  │ Avg delay   : {traj.get('avg_delay_seconds', '?')}s")
-            print(f"  │ Wall time   : {result['wall_time_seconds']}s")
-            if "llm_calls" in result:
-                print(f"  │ LLM calls   : {result['llm_calls']}")
-                print(f"  │ LLM latency : {result['llm_avg_latency_ms']}ms avg")
-            print(f"  └──────────────────────────────────────")
-
-        except Exception as e:
-            print(f"  ✗ Error: {e}")
-            import traceback; traceback.print_exc()
-
-    # Summary table
-    if len(all_results) > 1:
-        print(f"\n{'='*60}")
-        print("  SUMMARY")
-        print(f"{'='*60}")
-        print(f"  {'Task':<35s} {'Score':>8s}")
-        print(f"  {'─'*35} {'─'*8}")
-        for r in all_results:
-            print(f"  {r['task_id']:<35s} {r['score']:>8.4f}")
-        scores = [r["score"] for r in all_results]
-        print(f"  {'─'*35} {'─'*8}")
-        print(f"  {'Average':<35s} {sum(scores)/len(scores):>8.4f}")
-        print()
-
-    # Output JSON
-    output_path = args.output
-    if output_path:
-        with open(output_path, "w") as f:
-            json.dump({"results": all_results, "policy": args.policy, "seed": args.seed}, f, indent=2)
-        print(f"  Results written to: {output_path}")
-    else:
-        print("\n  Full JSON results:")
-        print(json.dumps({"results": all_results}, indent=2))
-
-
-if __name__ == "__main__":
-    main()
+    return {
+        "task_id":      task_id,
+        "policy":       policy,
+        "seed":         seed,
+        "steps":        steps,
+        "total_reward": round(total_reward, 4),
+        "reward_mean":  round(mean_r, 4),
+        "grade":        grade,
+        "score":        grade["score"],
+        "metrics": {
+            "avg_delay_s":      summary["avg_delay_s"],
+            "efficiency_ratio": summary["efficiency_ratio"],
+            "los":              summary["los"],
+            "total_cleared":    summary["total_cleared"],
+            "emission_kg_co2":  summary["emission_kg_co2"],
+        },
+        "impact_summary": impact.summary(),
+    }
