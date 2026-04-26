@@ -80,9 +80,22 @@ class DQNPolicy:
         try:
             vec = obs.get("observation_vector", None)
             if vec is None:
-                self._fallback_count += 1
-                print("[DQNPolicy] WARNING: observation_vector missing — using fallback", flush=True)
-                return self._fallback.act(obs)
+                # Reconstruct 57-dim vector from obs dict fields (obs dict lacks observation_vector key)
+                ql  = obs.get("queue_lengths",     [0.0] * 12)
+                tp  = obs.get("throughput_recent", [0.0] * 12)
+                ai  = obs.get("arrival_intensity", [0.0] * 12)
+                ph  = obs.get("phase_onehot",      [1, 0, 0, 0])
+                sp  = obs.get("spillback_flags",   [0.0] * 12)
+                vec = (
+                    list(ql) + list(tp) + list(ai) + list(ph) + [
+                       obs.get("phase_elapsed_norm",    0.0),
+                       obs.get("fairness_score",        0.0),
+                       obs.get("pressure_differential", 0.0),
+                       obs.get("avg_delay_norm",        0.0),
+                       obs.get("step_norm",             0.0),
+                    ] + list(sp)
+                )
+                # fallback count only if reconstruction also fails
 
             x = np.array(vec, dtype=np.float32)
 
@@ -203,6 +216,10 @@ def run_episode(
     reset_data = client.reset(task_id, seed=seed)
     session_id = reset_data["session_id"]
     horizon = reset_data.get("horizon", 600)
+    # Merge top-level observation_vector into the obs dict so DQNPolicy can find it
+    _obs_raw = reset_data.get("observation", {})
+    if isinstance(_obs_raw, dict):
+        _obs_raw["observation_vector"] = reset_data.get("observation_vector", [])
 
     if policy_name == "pressure":
         policy = PressurePolicy()
@@ -231,6 +248,8 @@ def run_episode(
         step_data = client.step(session_id, action)
 
         obs = step_data.get("observation", {})
+        if isinstance(obs, dict):
+            obs["observation_vector"] = step_data.get("observation_vector", obs.get("observation_vector", []))
         reward = step_data.get("reward", 0.0)
         done = step_data.get("done", False)
         info = step_data.get("info", {})

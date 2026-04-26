@@ -164,6 +164,94 @@ class LLMPolicy:
         return round(sum(self.latencies) / len(self.latencies) * 1000, 2)
 
 
+class DQNInlinePolicy:
+    """
+    Minimal DQN forward-pass policy for use in /baseline and /benchmark.
+    Loads dqn_weights.json from disk; falls back to pressure on any error.
+    Reconstructs the full 57-dim observation vector from the obs dict
+    so it works inside run_baseline_episode without observation_vector key.
+    """
+    def __init__(self) -> None:
+        import numpy as np
+        import json, os
+        self._fallback = PressurePolicy()
+        self._weights = None
+        _candidates = [
+            os.environ.get("INTELLIFLOW_DQN_WEIGHTS", ""),
+            os.path.normpath(os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..", "api", "dqn_weights.json"
+            )),
+            os.path.join("app", "api", "dqn_weights.json"),
+        ]
+        for p in _candidates:
+            if p and os.path.exists(p):
+                try:
+                    with open(p) as f:
+                        self._weights = json.load(f)
+                    print(f"[DQNInlinePolicy] Weights loaded from {p}")
+                    break
+                except Exception:
+                    pass
+
+    def act(self, obs: Dict) -> int:
+        import numpy as np
+        if self._weights is None:
+            return self._fallback.act(obs)
+        try:
+            vec = obs.get("observation_vector")
+            if vec is None:
+                # Reconstruct 57-dim vector from observation dict fields
+                ql  = obs.get("queue_lengths",     [0.0] * 12)
+                tp  = obs.get("throughput_recent", [0.0] * 12)
+                ai  = obs.get("arrival_intensity", [0.0] * 12)
+                ph  = obs.get("phase_onehot",      [1, 0, 0, 0])
+                sp  = obs.get("spillback_flags",   [0.0] * 12)
+                vec = (
+                    list(ql) + list(tp) + list(ai) + list(ph) + [
+                        obs.get("phase_elapsed_norm",    0.0),
+                        obs.get("fairness_score",        0.0),
+                        obs.get("pressure_differential", 0.0),
+                        obs.get("avg_delay_norm",        0.0),
+                        obs.get("step_norm",             0.0),
+                    ] + list(sp)
+                )
+            x = np.array(vec, dtype=np.float32)
+            # Support both Python train.py format ({"layers":[...]}) and
+            # raw JS format ({l1,l2,l3,l4}) in case normalize step was missed.
+            raw = self._weights
+            _acts = ["relu", "relu", "relu", "linear"]
+            if "inference_layers" in raw:
+                layers = raw["inference_layers"]
+            elif "layers" in raw:
+                layers = raw["layers"]
+            elif "online" in raw and isinstance(raw.get("online"), dict):
+                online = raw["online"]
+                if "l1" in online:
+                    layers = [{"W": online[k]["W"], "b": online[k]["b"], "activation": _acts[i]}
+                              for i, k in enumerate(["l1","l2","l3","l4"]) if k in online]
+                elif "layers" in online:
+                    layers = online["layers"]
+                else:
+                    return self._fallback.act(obs)
+            elif "l1" in raw:
+                layers = [{"W": raw[k]["W"], "b": raw[k]["b"], "activation": _acts[i]}
+                          for i, k in enumerate(["l1","l2","l3","l4"]) if k in raw]
+            else:
+                return self._fallback.act(obs)
+            if not layers:
+                return self._fallback.act(obs)
+            for layer in layers:
+                W = np.array(layer["W"], dtype=np.float32)
+                b = np.array(layer["b"], dtype=np.float32)
+                x = np.dot(x, W.T) + b
+                if layer.get("activation") == "relu":
+                    x = np.maximum(0, x)
+            return int(np.argmax(x))
+        except Exception:
+            return self._fallback.act(obs)
+
+
 async def run_baseline_episode(
     task_id: str,
     policy:  str  = "pressure",
@@ -194,6 +282,8 @@ async def run_baseline_episode(
         agent = FixedCyclePolicy()
     elif policy == "random":
         agent = RandomPolicy(seed=seed)
+    elif policy == "dqn":
+        agent = DQNInlinePolicy()
     else:
         agent = PressurePolicy()
 

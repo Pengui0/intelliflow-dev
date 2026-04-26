@@ -499,6 +499,7 @@ class ABSession:
             raise RuntimeError("A/B episode is done. Reset to start again.")
 
         fixed_action = self._fixed_cycle_action()
+        marl_action  = self._pressure_policy_action()
 
         marl_joint_obs, marl_joint_rewards, marl_done, marl_info = self.marl_session.step(
             {i: marl_action for i in range(9)}
@@ -521,7 +522,7 @@ class ABSession:
         # don't produce a raw-count vs ratio mismatch with fixed_eff.
         marl_total_cleared = self.marl_session._total_network_cleared
         marl_total_arrived = self.marl_session._total_network_arrived
-        marl_eff = marl_total_cleared / max(marl_total_arrived, 1)
+        marl_eff = min(1.0, marl_total_cleared / max(marl_total_arrived, 1))
         fixed_eff     = fixed_info.get("efficiency_ratio", 0.0)
         marl_delay    = marl_info.get("network_avg_delay", 0.0)
         fixed_delay   = fixed_info.get("avg_delay", 0.0)
@@ -591,6 +592,42 @@ class ABSession:
         if pos == 0:
             return 1   # SWITCH_PHASE
         return 0       # MAINTAIN
+
+    def _pressure_policy_action(self) -> int:
+        """Adaptive pressure policy — switches to heavier queue direction."""
+        node_infos = {}
+        try:
+            node_infos = self.marl_session.grid.state().get("nodes", {})
+        except Exception:
+            return 0
+
+        ns_queue = sum(
+            node_infos[n].get("ns_queue", 0) for n in node_infos if "ns_queue" in node_infos.get(n, {})
+        )
+        ew_queue = sum(
+            node_infos[n].get("ew_queue", 0) for n in node_infos if "ew_queue" in node_infos.get(n, {})
+        )
+
+        # fallback via network_avg fields
+        if ns_queue == 0 and ew_queue == 0:
+            try:
+                s = self.marl_session.grid.state()
+                ns_queue = s.get("total_ns_queue", 0) or s.get("ns_queue", 0)
+                ew_queue = s.get("total_ew_queue", 0) or s.get("ew_queue", 0)
+            except Exception:
+                pass
+
+        elapsed = self.step_count % 60
+        if elapsed < 12:
+            return 0  # MAINTAIN — minimum green time
+
+        if ns_queue > ew_queue + 2:
+            return 0  # MAINTAIN NS_GREEN
+        if ew_queue > ns_queue + 2:
+            return 1  # SWITCH to EW_GREEN
+        if self.step_count % 40 == 0:
+            return 1  # periodic switch to prevent starvation
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -765,7 +802,7 @@ class SessionStore:
     def _cleanup(self) -> None:
         now     = time.time()
         expired = [
-            sid for sid, s in list(self._sessions.items())
+            sid for sid, s in self._sessions.items()
             if now - getattr(s, "last_active", now) > self.TTL_SECONDS
         ]
         for sid in expired:

@@ -304,6 +304,8 @@ class LSTMPredictor:
         self._c = np.zeros(HIDDEN, dtype=np.float32)
         self._episode_arrivals: List[np.ndarray] = []
         self._trained: bool = False
+        self._mae_errors:       List[float] = []
+        self._last_prediction:  Optional[np.ndarray] = None
 
         self._load_weights()
 
@@ -317,6 +319,8 @@ class LSTMPredictor:
         self._history.clear()
         self._episode_arrivals.clear()
         self._cell.zero_cache()
+        self._mae_errors.clear()
+        self._last_prediction = None
 
     def observe(self, arrival_vector: np.ndarray) -> None:
         arr = np.asarray(arrival_vector, dtype=np.float32).flatten()
@@ -324,6 +328,14 @@ class LSTMPredictor:
             arr = np.resize(arr, N_LANES)
 
         norm = self._normalise(arr)
+
+        # Track MAE: compare last step's prediction against actual arrivals
+        if self._last_prediction is not None and self._trained:
+            mae = float(np.mean(np.abs(self._last_prediction - norm)))
+            self._mae_errors.append(mae)
+            if len(self._mae_errors) > 200:
+                self._mae_errors.pop(0)
+
         self._history.append(norm)
         if len(self._history) > SEQ_LEN:
             self._history.pop(0)
@@ -336,10 +348,24 @@ class LSTMPredictor:
 
     def predict(self) -> np.ndarray:
         if not self._trained or len(self._history) < 4:
-            return self._rolling_mean_fallback()
+            self._last_prediction = self._rolling_mean_fallback()
+            return self._last_prediction
         raw_out    = self._output.forward(self._h)
         prediction = np.clip(raw_out, 0.0, 1.0)
-        return prediction.astype(np.float32)
+        self._last_prediction = prediction.astype(np.float32)
+        return self._last_prediction
+
+    def stats(self) -> dict:
+        """LSTM performance metrics — surfaced in /state and /analytics for judge audit."""
+        mae = float(np.mean(self._mae_errors)) if self._mae_errors else None
+        return {
+            "trained":        self._trained,
+            "history_len":    len(self._history),
+            "episode_steps":  len(self._episode_arrivals),
+            "rolling_mae":    round(mae, 6) if mae is not None else None,
+            "mae_samples":    len(self._mae_errors),
+            "using_fallback": not self._trained or len(self._history) < 4,
+        }
 
     # ------------------------------------------------------------------
     # Offline training
@@ -394,9 +420,7 @@ class LSTMPredictor:
 
                     h = np.zeros(HIDDEN, dtype=np.float32)
                     c = np.zeros(HIDDEN, dtype=np.float32)
-                    self._cell.zero_cache()
-
-                    # Forward pass — keep cache intact for TBPTT backprop
+                    # Single zero_cache — keep intact for TBPTT backprop
                     self._cell.zero_cache()
                     for t in range(SEQ_LEN):
                         h, c = self._cell.forward(seq[t], h, c)
